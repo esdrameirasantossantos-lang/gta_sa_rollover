@@ -1,0 +1,41 @@
+name: Build Realistic Rollover Plugin
+
+# Roda automaticamente a cada push, e tambem pode ser disparado manualmente
+# pela aba "Actions" do GitHub (botao "Run workflow").
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar o codigo do repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r25c
+          add-to-path: true
+
+      - name: Compilar plugin (ndk-build)
+        run: |
+          ${{ steps.setup-ndk.outputs.ndk-path }}/ndk-build \
+            NDK_PROJECT_PATH=${{ github.workspace }} \
+            APP_BUILD_SCRIPT=${{ github.workspace }}/examples/game_sa/realistic_rollover/Android.mk \
+            NDK_APPLICATION_MK=${{ github.workspace }}/Application.mk \
+            NDK_DEBUG=0
+
+      - name: Mostrar onde os .so foram gerados (debug)
+        run: find ${{ github.workspace }} -name "*.so"
+
+      - name: Enviar .so como artifact pra download
+        uses: actions/upload-artifact@v4
+        with:
+          name: PSDK_RealisticRollover-so
+          path: |
+            **/libPSDK_RealisticRollover*.so
+          if-no-files-found: error
