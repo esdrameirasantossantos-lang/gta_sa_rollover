@@ -201,7 +201,7 @@ ON_MOD_LOAD()
         if (dt <= 0.0f || dt > 0.2f) dt = 1.0f / 30.0f; // protege contra spikes/pause
 
         ProcessRealisticRollover(veh, dt);
-    };
+    };   
 
-    Log("[RealisticRollover] Plugin carregado com sucesso.");
 }
+
