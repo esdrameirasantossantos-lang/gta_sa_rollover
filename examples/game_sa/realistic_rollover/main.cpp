@@ -1,149 +1,127 @@
-// ============================================================================
-// Realistic Rollover Physics — AML PSDK plugin para GTA San Andreas Android
-// ============================================================================
-#include <mod/amlmod.h>
-#include <mod/logger.h>
 
-#include <aml-psdk/game_sa/Events.h>
-#include <aml-psdk/game_sa/entity/PlayerPed.h>
-#include <aml-psdk/game_sa/entity/Vehicle.h>
-#include <aml-psdk/game_sa/entity/Automobile.h>
-#include <aml-psdk/game_sa/enum/SurfaceType.h>
-#include <aml-psdk/game_sa/base/Timer.h>
-#include <aml-psdk/gta_base/Vector.h>
-#include <aml-psdk/game_sa/base/Matrix.h>
 #include <cmath>
 
-MYMOD(net.rusjj.psdkexample.realisticrollover, Realistic Rollover Physics, 1.0, Claude)
+enum class SurfaceType {
+    Asphalt,
+    Concrete,
+    Dirt,
+    Grass,
+    Sand,
+    Metal,
+    WetRoad
+};
 
-static const float ROLLOVER_UP_THRESHOLD = 0.95f;
-static const float MIN_SPEED_FOR_EFFECT = 0.14f;
-static const float SPIN_GAIN = 0.66f;
-static const float MAX_EXTRA_SPIN = 0.78f;
-static const float SPIN_BLEND_RATE = 0.66f;
-static const bool ENABLE_SLIDE_EFFECT = true;    
+struct SurfaceProfile {
+    float tireGrip;
+    float bodyFriction;
+    float rollingResistance;
+    float tireCatch;
+};
 
-static float GetSurfaceGrip(unsigned char surface)
-{
-    switch (surface)
-    {
-        case SURFACE_TARMAC:
-        case SURFACE_TARMAC_FUCKED:
-        case SURFACE_TARMAC_REALLYFUCKED:
-        case SURFACE_PAVEMENT:
-        case SURFACE_PAVEMENT_FUCKED:
-        case SURFACE_FUCKED_CONCRETE:
-        case SURFACE_PAINTED_GROUND:
-            return 0.80f;
+struct ContactState {
+    float forwardSpeed;
+    float lateralSpeed;
+    float impactSpeed;
 
-        case SURFACE_GRAVEL:
-            return 0.55f;
+    // 0.0 a 1.0: carga lateral nas rodas
+    float wheelSideLoad;
 
-        case SURFACE_GRASS_SHORT_LUSH:
-        case SURFACE_GRASS_MEDIUM_LUSH:
-        case SURFACE_GRASS_LONG_LUSH:
-        case SURFACE_GRASS_SHORT_DRY:
-        case SURFACE_GRASS_MEDIUM_DRY:
-        case SURFACE_GRASS_LONG_DRY:
-        case SURFACE_GOLFGRASS_ROUGH:
-        case SURFACE_GOLFGRASS_SMOOTH:
-            return 0.35f;
+    // 0.0 a 1.0: contato da carroceria com o chão
+    float bodyContact;
+};
 
-        case SURFACE_STEEP_SLIDYGRASS:
-        case SURFACE_STEEP_CLIFF:
-            return 0.20f;
+struct SurfaceResult {
+    float tireGrip;
+    float bodySlide;
+    float rollingResistance;
 
-        default:
-            return 0.55f;
-    }
+    // Intensidade relativa que pode contribuir
+    // para o capotamento. Não é torque físico real.
+    float rolloverContribution;
+};
+
+static float clampf(float v, float lo, float hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
 }
 
-static void ProcessRealisticRollover(CVehicle* veh, float dt)
-{
-    if (!veh) return;
+static SurfaceProfile getSurface(SurfaceType type) {
+    switch (type) {
+        case SurfaceType::Asphalt:
+            return {1.00f, 0.80f, 0.08f, 1.00f};
 
-    CPhysical* phys = (CPhysical*)veh;
+        case SurfaceType::Concrete:
+            return {0.95f, 0.85f, 0.10f, 0.95f};
 
-    if (!phys->bOnSolidSurface) return;
+        case SurfaceType::Dirt:
+            return {0.65f, 0.55f, 0.22f, 0.65f};
 
-    CMatrix* mat = veh->GetMatrix();
-    if (!mat) return;
+        case SurfaceType::Grass:
+            return {0.50f, 0.45f, 0.28f, 0.50f};
 
-    float upZ = mat->GetUp().z;
+        case SurfaceType::Sand:
+            return {0.38f, 0.65f, 0.65f, 0.35f};
 
-    if (upZ > ROLLOVER_UP_THRESHOLD) return;
+        case SurfaceType::Metal:
+            return {0.45f, 0.30f, 0.06f, 0.40f};
 
-    CVector& moveSpeed = phys->m_vecMoveSpeed;
-    float linSpeed = moveSpeed.Magnitude();
-
-    if (linSpeed < MIN_SPEED_FOR_EFFECT) return;
-
-    float grip = GetSurfaceGrip(phys->m_nContactSurface);
-
-    CVector& turnSpeed = phys->m_vecTurnSpeed;
-    float curSpin = turnSpeed.Magnitude();
-
-    float targetSpin = linSpeed * SPIN_GAIN;
-    if (targetSpin > MAX_EXTRA_SPIN) targetSpin = MAX_EXTRA_SPIN;
-
-    CVector axis;
-    if (curSpin > 0.05f)
-    {
-        float invCur = 1.0f / curSpin;
-        axis = CVector(turnSpeed.x * invCur, turnSpeed.y * invCur, turnSpeed.z * invCur);
-    }
-    else
-    {
-        CVector worldUp(0.0f, 0.0f, 1.0f);
-        CVector moveDir(moveSpeed.x / linSpeed, moveSpeed.y / linSpeed, moveSpeed.z / linSpeed);
-
-        CVector rawAxis(
-            moveDir.y * worldUp.z - moveDir.z * worldUp.y,
-            moveDir.z * worldUp.x - moveDir.x * worldUp.z,
-            moveDir.x * worldUp.y - moveDir.y * worldUp.x
-        );
-        float axisLen = rawAxis.Magnitude();
-        if (axisLen < 0.001f) return;
-        float inv = 1.0f / axisLen;
-        axis = CVector(rawAxis.x * inv, rawAxis.y * inv, rawAxis.z * inv);
+        case SurfaceType::WetRoad:
+            return {0.58f, 0.65f, 0.10f, 0.55f};
     }
 
-    float blend = 1.0f - expf(-SPIN_BLEND_RATE * dt);
-    float newSpinMag = curSpin + (targetSpin - curSpin) * blend;
-    if (newSpinMag < 0.0f) newSpinMag = 0.0f;
-    if (newSpinMag > MAX_EXTRA_SPIN) newSpinMag = MAX_EXTRA_SPIN;
-
-    turnSpeed.x = axis.x * newSpinMag;
-    turnSpeed.y = axis.y * newSpinMag;
-    turnSpeed.z = axis.z * newSpinMag;
-
-    if (ENABLE_SLIDE_EFFECT)
-{
-    float frictionDrop = (1.0f - grip) * dt * 1.6f;
-    float keepFactor = 1.0f - (grip * dt * 0.9f) + frictionDrop;
-
-    if (keepFactor > 1.0f) keepFactor = 1.0f;
-    if (keepFactor < 0.85f) keepFactor = 0.85f;
-
-    moveSpeed.x *= keepFactor;
-    moveSpeed.y *= keepFactor;
-    moveSpeed.z *= keepFactor;
-}
+    return {0.70f, 0.60f, 0.15f, 0.70f};
 }
 
-ON_MOD_LOAD()
-{
-    Events::gameProcessEvent += []()
-    {
-        CPlayerPed* player = FindPlayerPed(-1);
-        if (!player) return;
+static SurfaceResult calculateSurface(
+    SurfaceType type,
+    const ContactState& contact
+) {
+    SurfaceProfile s = getSurface(type);
+    SurfaceResult out{};
 
-        CVehicle* veh = player->m_pVehicle;
-        if (!veh) return;
+    float speed = std::fabs(contact.forwardSpeed);
+    float lateral = std::fabs(contact.lateralSpeed);
+    float impact = clampf(contact.impactSpeed / 18.0f,
+                          0.0f, 1.0f);
 
-        float dt = CTimer::GetTimeStepInSeconds();
-        if (dt <= 0.0f || dt > 0.2f) dt = 1.0f / 30.0f;
+    float wheelLoad = clampf(contact.wheelSideLoad,
+                             0.0f, 1.0f);
 
-        ProcessRealisticRollover(veh, dt);
-    };
+    float body = clampf(contact.bodyContact, 0.0f, 1.0f);
+
+    // A velocidade lateral aumenta a tendência de deslizar.
+    float lateralSlip = clampf(lateral / 8.0f, 0.0f, 1.0f);
+
+    out.tireGrip = s.tireGrip;
+
+    out.bodySlide = clampf(
+        (1.0f - s.bodyFriction) * (0.35f + lateralSlip),
+        0.0f, 1.0f
+    );
+
+    out.rollingResistance = clampf(
+        s.rollingResistance * (0.25f + speed / 10.0f),
+        0.0f, 1.0f
+    );
+
+    // A roda precisa estar carregada lateralmente
+    // e existir movimento lateral para contribuir.
+    float wheelContribution =
+        wheelLoad *
+        lateralSlip *
+        s.tireGrip *
+        s.tireCatch;
+
+    // O contato da carroceria acrescenta influência
+    // conforme o impacto e o atrito da superfície.
+    float bodyContribution =
+        body * impact * s.bodyFriction * 0.25f;
+
+    // Não existe rotação automática por inclinação.
+    // O jogo ainda precisa aplicar a força resultante.
+    out.rolloverContribution = clampf(
+        wheelContribution + bodyContribution,
+        0.0f, 1.0f
+    );
+
+    return out;
 }
