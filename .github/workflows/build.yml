@@ -20,7 +20,11 @@ jobs:
         with:
           ndk-version: r25c
           add-to-path: true
-
+      - name: Baixar headers do AndroidModLoader (mod/amlmod.h)
+        run: |
+          git clone --depth 1 https://github.com/RusJJ/AndroidModLoader.git /tmp/aml-core
+          cp -r /tmp/aml-core/mod ${{ github.workspace }}/mod
+          cp -r /tmp/aml-core/include/* ${{ github.workspace }}/aml-psdk/ 2>/dev/null || true
       - name: Compilar plugin (ndk-build)
         run: |
           ${{ steps.setup-ndk.outputs.ndk-path }}/ndk-build \
