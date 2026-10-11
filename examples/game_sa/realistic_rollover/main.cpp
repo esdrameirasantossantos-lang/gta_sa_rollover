@@ -18,9 +18,10 @@ MYMOD(net.rusjj.psdkexample.realisticrollover, Realistic Rollover Physics, 1.0, 
 
 static const float ROLLOVER_UP_THRESHOLD = 0.55f;
 static const float MIN_SPEED_FOR_EFFECT = 0.08f;
-static const float SPIN_GAIN = 7.5f;
-static const float MAX_EXTRA_SPIN = 3.2f;
-static const float SPIN_BLEND_RATE = 5.0f;
+static const float SPIN_GAIN = 1.0f;
+static const float MAX_EXTRA_SPIN = 1.5f;
+static const float SPIN_BLEND_RATE = 1.5f;
+static const bool ENABLE_SLIDE_EFFECT = false;    
 
 static float GetSurfaceGrip(unsigned char surface)
 {
@@ -116,6 +117,8 @@ static void ProcessRealisticRollover(CVehicle* veh, float dt)
     turnSpeed.y = axis.y * newSpinMag;
     turnSpeed.z = axis.z * newSpinMag;
 
+    if (ENABLE_SLIDE_EFFECT)
+{
     float frictionDrop = (1.0f - grip) * dt * 1.6f;
     float keepFactor = 1.0f - (grip * dt * 0.9f) + frictionDrop;
 
@@ -125,6 +128,7 @@ static void ProcessRealisticRollover(CVehicle* veh, float dt)
     moveSpeed.x *= keepFactor;
     moveSpeed.y *= keepFactor;
     moveSpeed.z *= keepFactor;
+}
 }
 
 ON_MOD_LOAD()
