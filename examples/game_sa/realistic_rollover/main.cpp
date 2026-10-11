@@ -16,12 +16,12 @@
 
 MYMOD(net.rusjj.psdkexample.realisticrollover, Realistic Rollover Physics, 1.0, Claude)
 
-static const float ROLLOVER_UP_THRESHOLD = 0.55f;
-static const float MIN_SPEED_FOR_EFFECT = 0.08f;
-static const float SPIN_GAIN = 1.0f;
-static const float MAX_EXTRA_SPIN = 1.5f;
-static const float SPIN_BLEND_RATE = 1.5f;
-static const bool ENABLE_SLIDE_EFFECT = false;    
+static const float ROLLOVER_UP_THRESHOLD = 0.95f;
+static const float MIN_SPEED_FOR_EFFECT = 0.14f;
+static const float SPIN_GAIN = 0.66f;
+static const float MAX_EXTRA_SPIN = 0.78f;
+static const float SPIN_BLEND_RATE = 0.66f;
+static const bool ENABLE_SLIDE_EFFECT = true;    
 
 static float GetSurfaceGrip(unsigned char surface)
 {
