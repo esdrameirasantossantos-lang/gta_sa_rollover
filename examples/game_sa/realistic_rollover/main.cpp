@@ -17,8 +17,8 @@
 MYMOD(net.rusjj.psdkexample.realisticrollover, Realistic Rollover Physics, 1.0, Claude)
 
 static const float ROLLOVER_UP_THRESHOLD = 0.55f;
-static const float MIN_SPEED_FOR_EFFECT = 4.0f;
-static const float SPIN_GAIN = 0.07f;
+static const float MIN_SPEED_FOR_EFFECT = 0.08f;
+static const float SPIN_GAIN = 7.5f;
 static const float MAX_EXTRA_SPIN = 3.2f;
 static const float SPIN_BLEND_RATE = 5.0f;
 
