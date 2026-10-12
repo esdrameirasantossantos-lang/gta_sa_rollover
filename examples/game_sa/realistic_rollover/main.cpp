@@ -17,13 +17,21 @@ namespace Blowover
     // Intensidade fixa: 50%
     constexpr float STRENGTH = 0.50f;
 
-    // Limites de ativação
+    // Velocidade em unidades internas do GTA
     constexpr float MIN_SPEED = 0.25f;
+    constexpr float FULL_SPEED = 0.75f;
+
+    // Deslizamento lateral mínimo
     constexpr float LATERAL_THRESHOLD = 0.08f;
 
-    // Forças adicionais (valores iniciais para calibração)
-    constexpr float LIFT_FACTOR = 0.0008f;
-    constexpr float ROLL_FACTOR = 0.0004f;
+    // Forças iniciais para calibração no jogo
+    constexpr float LIFT_FACTOR = 0.25f;
+    constexpr float ROLL_FACTOR = 0.35f;
+
+    // Distâncias relativas ao centro do veículo
+    constexpr float REAR_DISTANCE = 1.5f;
+    constexpr float SIDE_DISTANCE = 0.9f;
+    constexpr float HEIGHT_OFFSET = 0.4f;
 
     inline float Clamp(float value, float minValue, float maxValue)
     {
@@ -37,40 +45,44 @@ ON_MOD_LOAD()
     Events::gameProcessEvent += []()
     {
         CPlayerPed* player = FindPlayerPed(-1);
+
         if (!player)
             return;
 
         CVehicle* vehicle = FindPlayerVehicle(-1, false);
+
         if (!vehicle || !vehicle->IsAutomobile())
             return;
 
         CAutomobile* car = vehicle->AsAutomobile();
 
-        // Velocidade linear atual
+        // Velocidade real atual, incluindo o efeito do boost.
         const CVector velocity = car->m_vecMoveSpeed;
-
-        // Eixo lateral da carroceria
-        const CVector right = car->GetRightDirection();
-
-        // Velocidade lateral relativa ao próprio veículo
-        const float lateralSpeed =
-            velocity.x * right.x +
-            velocity.y * right.y +
-            velocity.z * right.z;
-
         const float speed = velocity.Magnitude();
 
         if (speed < Blowover::MIN_SPEED)
             return;
+
+        // Eixos da própria carroceria.
+        const CVector right = car->GetRightDirection();
+        const CVector forward = car->GetTopDirection();
+        const CVector up = car->GetAtDirection();
+
+        // Velocidade projetada no eixo lateral do carro.
+        const float lateralSpeed =
+            velocity.x * right.x +
+            velocity.y * right.y +
+            velocity.z * right.z;
 
         const float lateral = std::fabs(lateralSpeed);
 
         if (lateral < Blowover::LATERAL_THRESHOLD)
             return;
 
-        // Intensidade baseada na velocidade e no deslizamento
+        // A intensidade cresce com a velocidade e o deslizamento.
         const float speedFactor = Blowover::Clamp(
-            (speed - Blowover::MIN_SPEED) * 2.0f,
+            (speed - Blowover::MIN_SPEED) /
+            (Blowover::FULL_SPEED - Blowover::MIN_SPEED),
             0.0f,
             1.0f
         );
@@ -82,39 +94,55 @@ ON_MOD_LOAD()
         );
 
         const float strength =
-            Blowover::STRENGTH * speedFactor * slipFactor;
+            Blowover::STRENGTH *
+            speedFactor *
+            slipFactor;
 
-        // Elevação adicional na região traseira
-        const CVector liftForce(
-            0.0f,
-            0.0f,
-            speed * speed *
-            Blowover::LIFT_FACTOR *
-            strength
+        // Ponto atrás do centro, seguindo a orientação do veículo.
+        const CVector rearOffset(
+            -forward.x * Blowover::REAR_DISTANCE
+                + up.x * Blowover::HEIGHT_OFFSET,
+            -forward.y * Blowover::REAR_DISTANCE
+                + up.y * Blowover::HEIGHT_OFFSET,
+            -forward.z * Blowover::REAR_DISTANCE
+                + up.z * Blowover::HEIGHT_OFFSET
         );
 
-        const CVector rearOffset(
-            0.0f,
-            -1.5f,
-            0.4f
+        // Força vertical adicional na região traseira.
+        const float liftMagnitude =
+            speed * speed *
+            Blowover::LIFT_FACTOR *
+            strength;
+
+        const CVector liftForce(
+            up.x * liftMagnitude,
+            up.y * liftMagnitude,
+            up.z * liftMagnitude
         );
 
         car->ApplyForce(liftForce, rearOffset, true);
 
-        // Torque adicional de rolagem
+        // Elevação de um dos lados para gerar rolagem lateral.
         const float rollDirection =
             lateralSpeed >= 0.0f ? -1.0f : 1.0f;
 
-        const CVector rollForce(
-            0.0f,
-            0.0f,
-            rollDirection *
-            speed *
-            lateral *
+        const float rollMagnitude =
+            speed * lateral *
             Blowover::ROLL_FACTOR *
-            strength
+            strength;
+
+        const CVector rollForce(
+            up.x * rollMagnitude,
+            up.y * rollMagnitude,
+            up.z * rollMagnitude
         );
 
-        car->ApplyTurnForce(rollForce, rearOffset);
+        const CVector sideOffset(
+            right.x * SIDE_DISTANCE * rollDirection,
+            right.y * SIDE_DISTANCE * rollDirection,
+            right.z * SIDE_DISTANCE * rollDirection
+        );
+
+        car->ApplyTurnForce(rollForce, sideOffset);
     };
 }
