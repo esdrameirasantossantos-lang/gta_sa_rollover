@@ -1,52 +1,30 @@
-#include <cmath>
-#include "plugin.h"
-#include "CPhysical.h"
-#include "CVehicle.h"
-#include "CAutomobile.h"
+#include <mod/amlmod.h>
+#include <aml-psdk/game_sa/Events.h>
+#include <aml-psdk/game_sa/entity/PlayerPed.h>
+#include <aml-psdk/game_sa/entity/Automobile.h>
+#include <aml-psdk/game_sa/entity/Physical.h>
 
-namespace RolloverPhysics
+MYMOD(
+    net.psdk.realisticrollover,
+    Realistic Rollover,
+    1.0,
+    Esdra
+)
+
+ON_MOD_LOAD()
 {
-    constexpr float ROLL_FORCE = 0.018f;
-    constexpr float SLIDE_FACTOR = 0.985f;
-    constexpr float MAX_ROLL_SPEED = 0.22f;
-    constexpr float MIN_IMPACT_SPEED = 0.045f;
-
-    inline float Clamp(float v, float min, float max)
+    Events::gameProcessEvent += []()
     {
-        return v < min ? min : (v > max ? max : v);
-    }
+        CPlayerPed* player = FindPlayerPed(-1);
 
-    void ApplyRollover(CAutomobile* car, float impact)
-    {
-        if (!car)
+        if (!player)
             return;
 
-        CPhysical* physical =
-            reinterpret_cast<CPhysical*>(car);
+        CVehicle* vehicle = FindPlayerVehicle(-1, false);
 
-        if (impact < MIN_IMPACT_SPEED)
+        if (!vehicle)
             return;
 
-        const float strength =
-            Clamp(impact * ROLL_FORCE, 0.0f, MAX_ROLL_SPEED);
-
-        // Preserve the original linear motion.
-        // The collision position should determine the
-        // actual torque direction in the final hook.
-
-        physical->m_vecTurnSpeed.x += strength;
-    }
-
-    void PreserveBodySlide(CAutomobile* car)
-    {
-        if (!car)
-            return;
-
-        CPhysical* physical =
-            reinterpret_cast<CPhysical*>(car);
-
-        // Small damping only; do not erase angular velocity.
-        physical->m_vecFrictionMoveSpeed.x *= SLIDE_FACTOR;
-        physical->m_vecFrictionMoveSpeed.y *= SLIDE_FACTOR;
-    }
+        // A lógica de capotamento entra aqui.
+    };
 }
