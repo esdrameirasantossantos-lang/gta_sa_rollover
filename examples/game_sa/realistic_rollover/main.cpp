@@ -1,5 +1,4 @@
 #include <mod/amlmod.h>
-#include <mod/logger.h>
 
 #include <cmath>
 #include <cstdint>
@@ -147,25 +146,18 @@ DECL_HOOK(bool, PhysicalApplyFriction, void* self, float friction, ColPointSA* c
 }
 
 ON_MOD_LOAD() {
-    logger->SetTag("Realistic Rollover");
-
     void* gtasaHandle = aml->GetLibHandle("libGTASA.so");
-    if (!gtasaHandle) {
-        logger->Error("libGTASA.so not found");
+    if (!gtasaHandle)
         return;
-    }
 
     FindPlayerVehicleNative = reinterpret_cast<FindPlayerVehicleFn>(
         aml->GetSym(gtasaHandle, "_Z17FindPlayerVehicleib"));
     ApplyTurnForceNative = reinterpret_cast<ApplyTurnForceFn>(
         aml->GetSym(gtasaHandle, "_ZN9CPhysical14ApplyTurnForceE7CVectorS0_"));
 
-    if (!FindPlayerVehicleNative || !ApplyTurnForceNative) {
-        logger->Error("Required GTA SA v2.00 symbols not found");
+    if (!FindPlayerVehicleNative || !ApplyTurnForceNative)
         return;
-    }
 
     HOOKSYM(PhysicalApplyFriction, gtasaHandle,
             "_ZN9CPhysical13ApplyFrictionEfR9CColPoint");
-    logger->Info("Hook installed: roof/side contact friction prototype");
 }
