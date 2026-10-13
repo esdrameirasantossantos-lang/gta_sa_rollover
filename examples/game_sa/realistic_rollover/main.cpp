@@ -1,5 +1,4 @@
 #include <mod/amlmod.h>
-#include <mod/logger.h>
 
 #include <cmath>
 #include <cstdint>
@@ -161,14 +160,11 @@ DECL_HOOK(bool, ApplyFriction, void* self, float friction, ColPointSA* cp)
 
 ON_MOD_LOAD()
 {
-    logger->SetTag("Realistic Rollover");
-
     const uintptr_t pGTASA = aml->GetLib("libGTASA.so");
     gtasaHandle = aml->GetLibHandle("libGTASA.so");
 
     if (!pGTASA || !gtasaHandle)
     {
-        logger->Error("libGTASA.so not found");
         return;
     }
 
@@ -180,7 +176,6 @@ ON_MOD_LOAD()
 
     if (!FindPlayerVehicleNative || !ApplyTurnForceNative)
     {
-        logger->Error("Required GTA SA v2.00 symbols not found");
         return;
     }
 
@@ -188,5 +183,4 @@ ON_MOD_LOAD()
     HOOKSYM(ApplyFriction, gtasaHandle,
             "_ZN9CPhysical13ApplyFrictionEfR9CColPoint");
 
-    logger->Info("Hook installed: native body-contact friction/roll prototype");
 }
