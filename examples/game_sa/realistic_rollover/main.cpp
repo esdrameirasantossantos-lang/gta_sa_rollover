@@ -54,13 +54,12 @@ static void* gtasaHandle = nullptr;
 static constexpr uintptr_t MATRIX_PTR_OFFSET = 0x14;
 static constexpr uintptr_t MOVE_SPEED_OFFSET = 0x48;
 
-// Tuning: this multiplier affects native friction at roof/side body contacts.
-// The extra turn force changes angular speed only; it does not directly cancel
-// the vehicle's linear sliding speed.
-static constexpr float BODY_FRICTION_MULTIPLIER = 1.30f;
-static constexpr float ROLL_GAIN = 2.50f;
-static constexpr float MAX_ROLL_FORCE = 0.80f;
-static constexpr float MIN_FORCE_FOR_ROLL = 0.055f;
+// Conservative tuning after the first build produced excessive spinning.
+// These values are a safety pass, not yet a verified blowover implementation.
+static constexpr float BODY_FRICTION_MULTIPLIER = 1.05f;
+static constexpr float ROLL_GAIN = 0.08f;
+static constexpr float MAX_ROLL_FORCE = 0.03f;
+static constexpr float MIN_FORCE_FOR_ROLL = 0.002f;
 
 static bool IsBodyGroundContact(void* self, const ColPointSA* cp,
                                 MatrixSA*& matrixOut, Vec3*& moveSpeedOut,
@@ -149,9 +148,13 @@ DECL_HOOK(bool, ApplyFriction, void* self, float friction, ColPointSA* cp)
             if (force2 > MAX_ROLL_FORCE * MAX_ROLL_FORCE)
                 force = Mul(force, MAX_ROLL_FORCE / std::sqrt(force2));
 
-            // The native function expects the WORLD contact point; it computes
-            // the lever arm from the vehicle's center of mass internally.
-            ApplyTurnForceNative(self, cp->point, force);
+            // IMPORTANT: ApplyTurnForce's first CVector is a position/lever
+            // arm, not a world-space contact coordinate. Passing cp->point
+            // directly adds the vehicle's world position to the lever arm and
+            // can create enormous angular velocity (the Beyblade bug).
+            // Convert the contact to vehicle-local offset before calling it.
+            const Vec3 leverArm = Sub(cp->point, matrix->pos);
+            ApplyTurnForceNative(self, leverArm, force);
         }
     }
 
