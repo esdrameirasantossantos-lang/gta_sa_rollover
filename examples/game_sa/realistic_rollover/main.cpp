@@ -2,7 +2,7 @@
 #include <cmath>
 #include <cstdint>
 
-MYMOD(net.esdra.realisticrollover, Realistic Rollover, 0.7, Esdra)
+MYMOD(net.esdra.realisticrollover, Realistic Rollover, 0.8, Esdra)
 
 BEGIN_DEPLIST()
     ADD_DEPENDENCY_VER(net.rusjj.aml, 1.3.0)
@@ -23,10 +23,17 @@ static inline float Clamp01(float x) {
 }
 
 struct MatrixSA {
-    Vec3 right;   uint32_t flagsRight;
-    Vec3 forward; uint32_t flagsForward;
-    Vec3 up;      uint32_t flagsUp;
-    Vec3 pos;     uint32_t flagsPos;
+    Vec3 right;
+    uint32_t flagsRight;
+
+    Vec3 forward;
+    uint32_t flagsForward;
+
+    Vec3 up;
+    uint32_t flagsUp;
+
+    Vec3 pos;
+    uint32_t flagsPos;
 };
 
 using FindPlayerVehicleFn = void* (*)(int, bool);
@@ -48,55 +55,139 @@ static constexpr float REAR_OFFSET = 1.45f;
 static constexpr float REAR_UP_OFFSET = 0.10f;
 static constexpr float MIN_UP_AXIS_Z = 0.70f;
 
-// Atrito artificial da carroceria
+// Atrito da carroceria
 static constexpr float BODY_FRICTION_MULTIPLIER = 2.2f;
 static constexpr float BODY_CONTACT_MIN_HEIGHT = 0.20f;
 static constexpr float BODY_TIPPED_LIMIT = 0.65f;
 
-DECL_HOOK(void, PhysicalApplyFriction,
-          void* self, float friction, void* colPoint)
-{
-    float adjustedFriction = friction;
+// Evita multiplicar o atrito duas vezes se os hooks
+// forem chamados um dentro do outro.
+static thread_local bool g_insideFrictionHook = false;
 
-    if (self && colPoint && FindPlayerVehicleNative) {
-        void* vehicle = FindPlayerVehicleNative(0, false);
+static MatrixSA* GetMatrix(void* entity) {
+    if (!entity)
+        return nullptr;
 
-        if (vehicle == self) {
-            auto* bytes = reinterpret_cast<uint8_t*>(self);
-            MatrixSA* matrix =
-                *reinterpret_cast<MatrixSA**>(
-                    bytes + MATRIX_PTR_OFFSET
-                );
+    auto* bytes = reinterpret_cast<uint8_t*>(entity);
 
-            if (matrix) {
-                // Supõe que os três primeiros floats de CColPoint
-                // representam a posição mundial do contato.
-                const Vec3 contact =
-                    *reinterpret_cast<Vec3*>(colPoint);
+    return *reinterpret_cast<MatrixSA**>(
+        bytes + MATRIX_PTR_OFFSET
+    );
+}
 
-                const Vec3 relative = {
-                    contact.x - matrix->pos.x,
-                    contact.y - matrix->pos.y,
-                    contact.z - matrix->pos.z
-                };
+// Esta verificação depende de CColPoint começar com
+// a posição mundial do contato. Isso precisa ser
+// confirmado para a versão exata do jogo.
+static bool IsBodyContact(void* vehicle, void* colPoint) {
+    if (!vehicle || !colPoint)
+        return false;
 
-                const float localHeight =
-                    Dot(relative, matrix->up);
+    MatrixSA* matrix = GetMatrix(vehicle);
 
-                // Só aumenta o atrito quando o carro está inclinado
-                // e o contato parece estar na região da carroceria.
-                if (matrix->up.z < BODY_TIPPED_LIMIT &&
-                    localHeight > BODY_CONTACT_MIN_HEIGHT) {
-                    adjustedFriction *= BODY_FRICTION_MULTIPLIER;
-                }
-            }
+    if (!matrix)
+        return false;
+
+    // Não aplicar o efeito enquanto o veículo está
+    // aproximadamente na posição normal.
+    if (matrix->up.z >= BODY_TIPPED_LIMIT)
+        return false;
+
+    const Vec3 contact =
+        *reinterpret_cast<Vec3*>(colPoint);
+
+    const Vec3 relative = {
+        contact.x - matrix->pos.x,
+        contact.y - matrix->pos.y,
+        contact.z - matrix->pos.z
+    };
+
+    // Distância do contato ao longo do eixo vertical
+    // local do veículo.
+    const float localHeight = Dot(relative, matrix->up);
+
+    return localHeight > BODY_CONTACT_MIN_HEIGHT;
+}
+
+static float AdjustBodyFriction(
+    void* vehicle,
+    float friction,
+    void* colPoint
+) {
+    if (g_insideFrictionHook)
+        return friction;
+
+    if (IsBodyContact(vehicle, colPoint))
+        return friction * BODY_FRICTION_MULTIPLIER;
+
+    return friction;
+}
+
+// Sobrecarga: ApplyFriction(float, CColPoint&)
+DECL_HOOK(
+    void,
+    PhysicalApplyFrictionSingle,
+    void* self,
+    float friction,
+    void* colPoint
+) {
+    float adjusted = friction;
+
+    void* playerVehicle = nullptr;
+
+    if (FindPlayerVehicleNative)
+        playerVehicle = FindPlayerVehicleNative(0, false);
+
+    if (self && self == playerVehicle) {
+        adjusted = AdjustBodyFriction(
+            self, friction, colPoint
+        );
+    }
+
+    const bool previous = g_insideFrictionHook;
+    g_insideFrictionHook = true;
+
+    PhysicalApplyFrictionSingle(
+        self, adjusted, colPoint
+    );
+
+    g_insideFrictionHook = previous;
+}
+
+// Sobrecarga: ApplyFriction(CPhysical*, float, CColPoint&)
+DECL_HOOK(
+    void,
+    PhysicalApplyFrictionPair,
+    void* self,
+    void* other,
+    float friction,
+    void* colPoint
+) {
+    float adjusted = friction;
+
+    void* playerVehicle = nullptr;
+
+    if (FindPlayerVehicleNative)
+        playerVehicle = FindPlayerVehicleNative(0, false);
+
+    if (playerVehicle) {
+        if (self == playerVehicle || other == playerVehicle) {
+            adjusted = AdjustBodyFriction(
+                playerVehicle, friction, colPoint
+            );
         }
     }
 
-    // Mantém a rotina original do jogo.
-    PhysicalApplyFriction(self, adjustedFriction, colPoint);
+    const bool previous = g_insideFrictionHook;
+    g_insideFrictionHook = true;
+
+    PhysicalApplyFrictionPair(
+        self, other, adjusted, colPoint
+    );
+
+    g_insideFrictionHook = previous;
 }
 
+// Blowover
 DECL_HOOK(void, AutomobileProcessControl, void* self)
 {
     AutomobileProcessControl(self);
@@ -110,17 +201,13 @@ DECL_HOOK(void, AutomobileProcessControl, void* self)
     if (!vehicle || vehicle != self)
         return;
 
+    MatrixSA* matrix = GetMatrix(self);
+
     auto* bytes = reinterpret_cast<uint8_t*>(self);
 
-    MatrixSA* matrix =
-        *reinterpret_cast<MatrixSA**>(
-            bytes + MATRIX_PTR_OFFSET
-        );
-
-    Vec3* velocity =
-        reinterpret_cast<Vec3*>(
-            bytes + MOVE_SPEED_OFFSET
-        );
+    Vec3* velocity = reinterpret_cast<Vec3*>(
+        bytes + MOVE_SPEED_OFFSET
+    );
 
     if (!matrix || !velocity)
         return;
@@ -160,12 +247,15 @@ DECL_HOOK(void, AutomobileProcessControl, void* self)
         0.0f, -REAR_OFFSET, REAR_UP_OFFSET
     };
 
-    ApplyTurnForceNative(self, upwardForce, rearOffset);
+    ApplyTurnForceNative(
+        self, upwardForce, rearOffset
+    );
 }
 
 ON_MOD_LOAD()
 {
-    void* gtasaHandle = aml->GetLibHandle("libGTASA.so");
+    void* gtasaHandle =
+        aml->GetLibHandle("libGTASA.so");
 
     if (!gtasaHandle)
         return;
@@ -191,9 +281,15 @@ ON_MOD_LOAD()
         return;
 
     HOOKSYM(
-        PhysicalApplyFriction,
+        PhysicalApplyFrictionSingle,
         gtasaHandle,
         "_ZN9CPhysical13ApplyFrictionEfR9CColPoint"
+    );
+
+    HOOKSYM(
+        PhysicalApplyFrictionPair,
+        gtasaHandle,
+        "_ZN9CPhysical13ApplyFrictionEPS_fR9CColPoint"
     );
 
     HOOKSYM(
