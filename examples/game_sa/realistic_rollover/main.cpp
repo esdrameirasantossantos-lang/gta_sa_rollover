@@ -1,207 +1,192 @@
-// ============================================================================
-// Realistic Rollover Physics — AML PSDK plugin para GTA San Andreas Android
-// ============================================================================
-// Problema que este plugin resolve:
-//   No GTA SA, quando um veiculo capota, a engine gira o corpo em torno do seu
-//   proprio eixo (m_vecTurnSpeed) mas praticamente nao transfere a velocidade
-//   linear (m_vecMoveSpeed) para fora do corpo durante o giro — o carro "roda
-//   no lugar" em vez de girar E deslizar ao mesmo tempo, como acontece em
-//   jogos com solver rigido-corpo mais completo (BeamNG, etc).
-//
-// Solucao:
-//   A cada frame de fisica, se o veiculo do jogador estiver:
-//     1) em contato com o chao (bOnSolidSurface)
-//     2) com inclinacao alta o suficiente pra ser considerado "capotando"
-//   entao:
-//     - aumentamos a velocidade angular (m_vecTurnSpeed) proporcionalmente a
-//       velocidade linear atual (quanto mais rapido, mais rapido capota)
-//     - reduzimos o "travamento" de atrito lateral multiplicando
-//       m_vecMoveSpeed por um fator de grip que depende da superficie
-//       (m_nContactSurface), permitindo o corpo deslizar enquanto gira
-//
-// Compilar: coloque esta pasta dentro de examples/game_sa/ no repo aml-psdk
-// e rode build.ps1 (ou ndk-build apontando pro Android.mk desta pasta).
-// Resultado: libPSDK_RealisticRollover.so (32-bit) — carregue via AML loader.
-// ============================================================================
-
 #include <mod/amlmod.h>
 #include <mod/logger.h>
 
-#include <aml-psdk/game_sa/Events.h>
-#include <aml-psdk/game_sa/entity/PlayerPed.h>
-#include <aml-psdk/game_sa/entity/Vehicle.h>
-#include <aml-psdk/game_sa/entity/Automobile.h>
-#include <aml-psdk/game_sa/enum/SurfaceType.h>
-#include <aml-psdk/game_sa/base/Timer.h>
-#include <aml-psdk/gta_base/Vector.h>
-#include <aml-psdk/game_sa/base/Matrix.h>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 
-MYMOD(net.rusjj.psdkexample.realisticrollover, Realistic Rollover Physics, 1.0, Claude)
+MYMOD(net.esdra.realisticrollover, Realistic Rollover, 0.3, Esdra)
 
-// ----------------------------------------------------------------------------
-// Configuracao ajustavel
-// ----------------------------------------------------------------------------
+BEGIN_DEPLIST()
+    ADD_DEPENDENCY_VER(net.rusjj.aml, 1.3.0)
+END_DEPLIST()
 
-// Abaixo desse valor de GetUp().z o carro e considerado "capotando"
-// (1.0 = totalmente em pe, 0.0 = de lado, -1.0 = de cabeca pra baixo)
-static const float ROLLOVER_UP_THRESHOLD = 0.55f;
+// Reverse-engineered from the user's GTA SA Android v2.00 armeabi-v7a libGTASA.so.
+// Experimental first pass: native friction + angular force at actual body-ground contacts.
+// This source has NOT been compiled or tested inside the game yet.
+// It is a reverse-engineering prototype, not a verified release build.
 
-// Quanto da velocidade linear vira velocidade angular extra por segundo.
-// Valores maiores = capota mais rapido em alta velocidade.
-static const float SPIN_GAIN = 0.11f;
+struct Vec3 {
+    float x, y, z;
+};
 
-// Limite maximo de velocidade angular extra que podemos injetar (rad/s),
-// pra nao deixar o carro girando feito pião infinito.
-static const float MAX_EXTRA_SPIN = 6.0f;
+static inline Vec3 Add(Vec3 a, Vec3 b) { return {a.x+b.x, a.y+b.y, a.z+b.z}; }
+static inline Vec3 Sub(Vec3 a, Vec3 b) { return {a.x-b.x, a.y-b.y, a.z-b.z}; }
+static inline Vec3 Mul(Vec3 a, float s) { return {a.x*s, a.y*s, a.z*s}; }
+static inline float Dot(Vec3 a, Vec3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+static inline float Len2(Vec3 a) { return Dot(a, a); }
 
-// Tabela de grip por superficie (1.0 = trava total / sem deslizar,
-// 0.0 = sem atrito nenhum / desliza livre). Usada so durante o capotamento.
-static float GetSurfaceGrip(unsigned char surface)
+struct MatrixSA {
+    Vec3 right;   uint32_t flagsRight;
+    Vec3 forward; uint32_t flagsForward; // RenderWare matrix's second axis
+    Vec3 up;      uint32_t flagsUp;      // RenderWare matrix's third axis
+    Vec3 pos;     uint32_t flagsPos;
+};
+
+struct ColPointSA {
+    Vec3 point;       // offset 0x00
+    float depth;      // offset 0x0C
+    Vec3 normal;      // offset 0x10
+    // Remaining material/piece fields are not needed here.
+};
+
+using FindPlayerVehicleFn = void* (*)(int playerId, bool includeRemote);
+using ApplyTurnForceFn = void (*)(void* physical, Vec3 worldPoint, Vec3 force);
+
+static FindPlayerVehicleFn FindPlayerVehicleNative = nullptr;
+static ApplyTurnForceFn ApplyTurnForceNative = nullptr;
+static void* gtasaHandle = nullptr;
+
+// Confirmed against ARMv7 instructions in the supplied libGTASA.so:
+// ApplyTurnForce reads the CPlaceable matrix pointer at self+0x14.
+// ApplyForce adds linear velocity at self+0x48; ApplyTurnForce adds angular
+// velocity at self+0x54. These are build-specific and must not be reused on
+// a different libGTASA.so version.
+static constexpr uintptr_t MATRIX_PTR_OFFSET = 0x14;
+static constexpr uintptr_t MOVE_SPEED_OFFSET = 0x48;
+
+// Tuning: this multiplier affects native friction at roof/side body contacts.
+// The extra turn force changes angular speed only; it does not directly cancel
+// the vehicle's linear sliding speed.
+static constexpr float BODY_FRICTION_MULTIPLIER = 1.30f;
+static constexpr float ROLL_GAIN = 2.50f;
+static constexpr float MAX_ROLL_FORCE = 0.80f;
+static constexpr float MIN_FORCE_FOR_ROLL = 0.055f;
+
+static bool IsBodyGroundContact(void* self, const ColPointSA* cp,
+                                MatrixSA*& matrixOut, Vec3*& moveSpeedOut,
+                                float& localXOut, float& localZOut)
 {
-    switch (surface)
-    {
-        case SURFACE_TARMAC:
-        case SURFACE_TARMAC_FUCKED:
-        case SURFACE_TARMAC_REALLYFUCKED:
-        case SURFACE_PAVEMENT:
-        case SURFACE_PAVEMENT_FUCKED:
-        case SURFACE_FUCKED_CONCRETE:
-        case SURFACE_PAINTED_GROUND:
-            return 0.80f; // asfalto/concreto: desliza pouco, trava mais rapido
+    if (!self || !cp)
+        return false;
 
-        case SURFACE_GRAVEL:
-            return 0.55f; // cascalho: grip medio-baixo
+    // Ground-like contact only. abs() allows either collision-normal orientation.
+    if (std::fabs(cp->normal.z) < 0.65f)
+        return false;
 
-        case SURFACE_GRASS_SHORT_LUSH:
-        case SURFACE_GRASS_MEDIUM_LUSH:
-        case SURFACE_GRASS_LONG_LUSH:
-        case SURFACE_GRASS_SHORT_DRY:
-        case SURFACE_GRASS_MEDIUM_DRY:
-        case SURFACE_GRASS_LONG_DRY:
-        case SURFACE_GOLFGRASS_ROUGH:
-        case SURFACE_GOLFGRASS_SMOOTH:
-            return 0.35f; // grama: desliza bastante
+    auto* bytes = reinterpret_cast<uint8_t*>(self);
+    matrixOut = *reinterpret_cast<MatrixSA**>(bytes + MATRIX_PTR_OFFSET);
+    moveSpeedOut = reinterpret_cast<Vec3*>(bytes + MOVE_SPEED_OFFSET);
 
-        case SURFACE_STEEP_SLIDYGRASS:
-        case SURFACE_STEEP_CLIFF:
-            return 0.20f; // terreno muito escorregadio
+    if (!matrixOut)
+        return false;
 
-        default:
-            return 0.55f; // fallback generico
-    }
+    const Vec3 relative = Sub(cp->point, matrixOut->pos);
+    localXOut = Dot(relative, matrixOut->right);
+    localZOut = Dot(relative, matrixOut->up);
+
+    // Roof contact: contact point is on the vehicle's local upper side.
+    const bool roofContact = localZOut > 0.25f;
+
+    // Side/body contact while tipped over. The lower wheel area is excluded.
+    const bool sideBodyContact =
+        std::fabs(localXOut) > 0.70f && localZOut > -0.12f;
+
+    return roofContact || sideBodyContact;
 }
 
-// ----------------------------------------------------------------------------
-// Logica principal (roda todo frame de fisica do jogo)
-// ----------------------------------------------------------------------------
-
-static void ProcessRealisticRollover(CVehicle* veh, float dt)
+DECL_HOOK(bool, ApplyFriction, void* self, float friction, ColPointSA* cp)
 {
-    if (!veh) return;
+    MatrixSA* matrix = nullptr;
+    Vec3* moveSpeed = nullptr;
+    float localX = 0.0f;
+    float localZ = 0.0f;
 
-    CPhysical* phys = (CPhysical*)veh; // CVehicle herda de CPhysical
+    bool bodyContact = false;
+    void* playerVehicle = nullptr;
 
-    // So mexe se o veiculo estiver tocando o chao — nao queremos afetar
-    // veiculos no ar (fisica de voo/queda fica como o jogo ja faz).
-    if (!phys->bOnSolidSurface) return;
-
-    CMatrix* mat = veh->GetMatrix();
-    if (!mat) return;
-
-    float upZ = mat->GetUp().z;
-
-    // So aplica o efeito quando o carro esta de fato capotando/na lateral
-    if (upZ > ROLLOVER_UP_THRESHOLD) return;
-
-    // Velocidade linear atual (unidades do jogo, nao km/h)
-    CVector& moveSpeed = phys->m_vecMoveSpeed;
-    float linSpeed = moveSpeed.Magnitude();
-    if (linSpeed < 0.002f) return; // parado, nao ha o que simular
-
-    float grip = GetSurfaceGrip(phys->m_nContactSurface);
-
-    // --- 1) Giro proporcional a velocidade --------------------------------
-    // Quanto mais rapido o carro esta indo, mais rapido ele deve capotar.
-    // Adicionamos a velocidade angular na direcao que o jogo ja escolheu
-    // (preserva o sentido do giro calculado pela engine), so amplificando.
-    CVector& turnSpeed = phys->m_vecTurnSpeed;
-    float curSpin = turnSpeed.Magnitude();
-
-    float desiredExtraSpin = linSpeed * SPIN_GAIN;
-    if (desiredExtraSpin > MAX_EXTRA_SPIN) desiredExtraSpin = MAX_EXTRA_SPIN;
-
-    if (curSpin > 0.001f)
+    if (FindPlayerVehicleNative && self && cp)
     {
-        // normaliza o eixo de giro atual e injeta spin extra nesse mesmo eixo
-        float invCur = 1.0f / curSpin;
-        CVector spinAxis(turnSpeed.x * invCur, turnSpeed.y * invCur, turnSpeed.z * invCur);
+        playerVehicle = FindPlayerVehicleNative(0, false);
 
-        float addAmount = desiredExtraSpin * dt * 30.0f; // normalizado p/ ~30fps de referencia
-        turnSpeed.x += spinAxis.x * addAmount;
-        turnSpeed.y += spinAxis.y * addAmount;
-        turnSpeed.z += spinAxis.z * addAmount;
-    }
-    else
-    {
-        // engine ainda nao decidiu eixo de giro (ex.: acabou de bater):
-        // usa o eixo perpendicular entre a direcao do movimento e o "up" do mundo,
-        // que e o eixo natural de capotamento (tomba pra frente/lado do impacto)
-        CVector worldUp(0.0f, 0.0f, 1.0f);
-        CVector moveDir(moveSpeed.x / linSpeed, moveSpeed.y / linSpeed, moveSpeed.z / linSpeed);
-
-        CVector axis(
-            moveDir.y * worldUp.z - moveDir.z * worldUp.y,
-            moveDir.z * worldUp.x - moveDir.x * worldUp.z,
-            moveDir.x * worldUp.y - moveDir.y * worldUp.x
-        );
-        float axisLen = axis.Magnitude();
-        if (axisLen > 0.001f)
+        // Only affect the player's current vehicle; don't change pedestrians,
+        // traffic vehicles, props, or ordinary wheel contacts.
+        if (playerVehicle == self)
         {
-            float inv = 1.0f / axisLen;
-            float addAmount = desiredExtraSpin * dt * 30.0f * 0.5f;
-            turnSpeed.x += axis.x * inv * addAmount;
-            turnSpeed.y += axis.y * inv * addAmount;
-            turnSpeed.z += axis.z * inv * addAmount;
+            bodyContact = IsBodyGroundContact(
+                self, cp, matrix, moveSpeed, localX, localZ);
+
+            if (bodyContact)
+                friction *= BODY_FRICTION_MULTIPLIER;
         }
     }
 
-    // --- 2) Deslize lateral durante o giro ---------------------------------
-    // Em vez de deixar o atrito nativo "grudar" o corpo no chao instantaneamente,
-    // reduzimos a velocidade linear de forma gradual (proporcional ao grip da
-    // superficie), simulando o corpo escorregando enquanto gira — como um carro
-    // capotando em alta velocidade realmente faz.
-    float frictionDrop = (1.0f - grip) * dt * 1.6f; // quanto MENOS grip, MENOS reducao = mais deslize
-    float keepFactor = 1.0f - (grip * dt * 0.9f) + frictionDrop;
+    // Let the game's own collision/friction solver run with the adjusted
+    // coefficient first. Its return value is preserved.
+    const bool result = ApplyFriction(self, friction, cp);
 
-    // clamp de seguranca pra nao inverter velocidade nem criar energia do nada
-    if (keepFactor > 1.0f) keepFactor = 1.0f;
-    if (keepFactor < 0.85f) keepFactor = 0.85f;
+    if (bodyContact && result && matrix && moveSpeed && ApplyTurnForceNative)
+    {
+        const float lateralSpeed = Dot(*moveSpeed, matrix->right);
+        const float forwardSpeed = Dot(*moveSpeed, matrix->forward);
 
-    moveSpeed.x *= keepFactor;
-    moveSpeed.y *= keepFactor;
-    moveSpeed.z *= keepFactor; // nao mexe tanto no Z pra nao estranhar a gravidade
+        // A roof contact uses lateral motion to create roll torque.
+        // A side contact uses forward motion to create roll torque.
+        Vec3 force;
+        if (localZ > 0.25f)
+            force = Mul(matrix->right, -lateralSpeed * ROLL_GAIN);
+        else
+            force = Mul(matrix->forward, -forwardSpeed * ROLL_GAIN);
+
+        // Project the added force onto the contact plane. This is more robust
+        // than forcing world Z to zero on a sloped surface.
+        const float normal2 = Len2(cp->normal);
+        if (normal2 > 0.0001f)
+            force = Sub(force, Mul(cp->normal, Dot(force, cp->normal) / normal2));
+
+        const float force2 = Len2(force);
+        if (force2 > MIN_FORCE_FOR_ROLL * MIN_FORCE_FOR_ROLL)
+        {
+            if (force2 > MAX_ROLL_FORCE * MAX_ROLL_FORCE)
+                force = Mul(force, MAX_ROLL_FORCE / std::sqrt(force2));
+
+            // The native function expects the WORLD contact point; it computes
+            // the lever arm from the vehicle's center of mass internally.
+            ApplyTurnForceNative(self, cp->point, force);
+        }
+    }
+
+    return result;
 }
-
-// ----------------------------------------------------------------------------
-// Entry point do mod
-// ----------------------------------------------------------------------------
 
 ON_MOD_LOAD()
 {
-    Events::gameProcessEvent += []()
+    logger->SetTag("Realistic Rollover");
+
+    const uintptr_t pGTASA = aml->GetLib("libGTASA.so");
+    gtasaHandle = aml->GetLibHandle("libGTASA.so");
+
+    if (!pGTASA || !gtasaHandle)
     {
-        CPlayerPed* player = FindPlayerPed(-1);
-        if (!player) return;
+        logger->Error("libGTASA.so not found");
+        return;
+    }
 
-        CVehicle* veh = player->m_pVehicle;
-        if (!veh) return;
+    FindPlayerVehicleNative = reinterpret_cast<FindPlayerVehicleFn>(
+        aml->GetSym(gtasaHandle, "_Z17FindPlayerVehicleib"));
 
-        float dt = CTimer::GetTimeStepInSeconds();
-        if (dt <= 0.0f || dt > 0.2f) dt = 1.0f / 30.0f; // protege contra spikes/pause
+    ApplyTurnForceNative = reinterpret_cast<ApplyTurnForceFn>(
+        aml->GetSym(gtasaHandle, "_ZN9CPhysical14ApplyTurnForceE7CVectorS0_"));
 
-        ProcessRealisticRollover(veh, dt);
-    };
+    if (!FindPlayerVehicleNative || !ApplyTurnForceNative)
+    {
+        logger->Error("Required GTA SA v2.00 symbols not found");
+        return;
+    }
 
-    Log("[RealisticRollover] Plugin carregado com sucesso.");
+    // ApplyFriction is exported by the supplied v2.00 ARMv7 libGTASA.so.
+    HOOKSYM(ApplyFriction, gtasaHandle,
+            "_ZN9CPhysical13ApplyFrictionEfR9CColPoint");
+
+    logger->Info("Hook installed: native body-contact friction/roll prototype");
 }
