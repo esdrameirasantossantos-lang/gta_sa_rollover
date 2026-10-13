@@ -2,15 +2,15 @@
 #include <cmath>
 #include <cstdint>
 
-MYMOD(net.esdra.realisticrollover, Realistic Rollover, 0.4, Esdra)
+MYMOD(net.esdra.realisticrollover, Realistic Rollover, 0.6, Esdra)
 
 BEGIN_DEPLIST()
     ADD_DEPENDENCY_VER(net.rusjj.aml, 1.3.0)
 END_DEPLIST()
 
 // GTA SA Android 2.00 / armeabi-v7a prototype.
-// This pass corrects the rear-lift torque and speed thresholds. Native body-contact
-// friction is NOT implemented in this file yet.
+// This pass corrects the ApplyTurnForce argument order and speed thresholds. Native
+// body-contact friction is NOT implemented in this file yet.
 
 struct Vec3 {
     float x, y, z;
@@ -94,17 +94,12 @@ DECL_HOOK(void, AutomobileProcessControl, void* self)
     if (impulse < 1.0f)
         return;
 
-    // IMPORTANT: ApplyTurnForce expects a WORLD-SPACE point, not a local offset.
-    // Convert a point behind the car's centre into world coordinates.
-    const Vec3 rearPoint = {
-        matrix->pos.x - matrix->forward.x * REAR_OFFSET + matrix->up.x * REAR_UP_OFFSET,
-        matrix->pos.y - matrix->forward.y * REAR_OFFSET + matrix->up.y * REAR_UP_OFFSET,
-        matrix->pos.z - matrix->forward.z * REAR_OFFSET + matrix->up.z * REAR_UP_OFFSET
-    };
-
-    // An upward force at the rear creates pitch torque to lift the rear end.
+    // ApplyTurnForce receives the force first and the application offset second.
+    // Use an offset relative to the vehicle centre; do not pass a world position
+    // as the force vector, because that can inject a huge invalid impulse.
     const Vec3 upwardForce = {0.0f, 0.0f, impulse};
-    ApplyTurnForceNative(self, rearPoint, upwardForce);
+    const Vec3 rearOffset = {0.0f, -REAR_OFFSET, REAR_UP_OFFSET};
+    ApplyTurnForceNative(self, upwardForce, rearOffset);
 }
 
 ON_MOD_LOAD()
