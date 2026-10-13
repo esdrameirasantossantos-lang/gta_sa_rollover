@@ -2,117 +2,106 @@
 #include <cmath>
 #include <cstdint>
 
-MYMOD(net.esdra.realisticrollover, Realistic Rollover, 1.0, Esdra)
+MYMOD(net.esdra.realisticrollover, Realistic Rollover, 1.1, Esdra)
 
 BEGIN_DEPLIST()
     ADD_DEPENDENCY_VER(net.rusjj.aml, 1.3.0)
 END_DEPLIST()
 
-// GTA SA Android 2.00 / ARMv7. Experimental source; compile and test in-game.
-// The friction hook only changes the friction coefficient. It NEVER applies
-// extra forces from inside the collision/friction callback.
+// Experimental GTA SA Android 2.00 / ARMv7 source.
+// Uses ApplyForce for linear lift + torque, not ApplyTurnForce alone.
 
 struct Vec3 { float x, y, z; };
-static inline Vec3 Sub(Vec3 a, Vec3 b) { return {a.x-b.x, a.y-b.y, a.z-b.z}; }
+static inline Vec3 Add(Vec3 a, Vec3 b) { return {a.x+b.x, a.y+b.y, a.z+b.z}; }
 static inline Vec3 Mul(Vec3 a, float s) { return {a.x*s, a.y*s, a.z*s}; }
 static inline float Dot(Vec3 a, Vec3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+static inline float Abs(float x) { return std::fabs(x); }
 static inline float Clamp01(float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); }
 
-// CMatrix basis layout: right, up, at/forward, position.
+// RenderWare CMatrix basis: right, up, at, position.
 struct MatrixSA {
     Vec3 right; uint32_t flagsRight;
     Vec3 up;    uint32_t flagsUp;
     Vec3 at;    uint32_t flagsAt;
     Vec3 pos;   uint32_t flagsPos;
 };
-
-struct ColPointSA {
-    Vec3 point;
-    float depth;
-    Vec3 normal;
-};
+struct ColPointSA { Vec3 point; float depth; Vec3 normal; };
 
 using FindPlayerVehicleFn = void* (*)(int playerId, bool includeRemote);
-// CPhysical::ApplyTurnForce(force, point-offset).
-using ApplyTurnForceFn = void (*)(void* physical, Vec3 force, Vec3 pointOffset);
+using ApplyForceFn = void (*)(void* physical, Vec3 force, Vec3 offset, bool validTorque);
 static FindPlayerVehicleFn FindPlayerVehicleNative = nullptr;
-static ApplyTurnForceFn ApplyTurnForceNative = nullptr;
+static ApplyForceFn ApplyForceNative = nullptr;
+static bool sawGroundContact = false;
 
 static constexpr uintptr_t MATRIX_PTR_OFFSET = 0x14;
 static constexpr uintptr_t MOVE_SPEED_OFFSET = 0x48;
 
-// Keep body friction restrained to avoid turning the collision into a sticky stop.
-static constexpr float BODY_FRICTION_MULTIPLIER = 1.15f;
-static constexpr float GROUND_NORMAL_Z_MIN = 0.65f;
-static constexpr float ROOF_LOCAL_Z_MIN = 0.25f;
-static constexpr float SIDE_LOCAL_X_MIN = 0.70f;
-static constexpr float SIDE_LOCAL_Z_MIN = -0.12f;
-
-// Blowover requires both forward motion and lateral slip; tune after a safe test.
-static constexpr float MIN_FORWARD_SPEED = 0.78f;
-static constexpr float MIN_LATERAL_SPEED = 0.24f;
-static constexpr float SPEED_RAMP = 0.95f;
-static constexpr float SLIP_RAMP = 0.55f;
-static constexpr float MAX_BLOWOVER_FORCE = 55.0f;
-static constexpr float REAR_OFFSET = 1.45f;
-static constexpr float REAR_UP_OFFSET = 0.10f;
-static constexpr float MIN_UP_AXIS_Z = 0.70f;
-
-static bool IsBodyGroundContact(void* self, const ColPointSA* cp) {
-    if (!self || !cp || std::fabs(cp->normal.z) < GROUND_NORMAL_Z_MIN)
-        return false;
-
-    auto* bytes = reinterpret_cast<uint8_t*>(self);
-    MatrixSA* matrix = *reinterpret_cast<MatrixSA**>(bytes + MATRIX_PTR_OFFSET);
-    if (!matrix) return false;
-
-    const Vec3 relative = Sub(cp->point, matrix->pos);
-    const float localX = Dot(relative, matrix->right);
-    const float localZ = Dot(relative, matrix->up);
-    const bool roofContact = localZ > ROOF_LOCAL_Z_MIN;
-    const bool sideContact = std::fabs(localX) > SIDE_LOCAL_X_MIN &&
-                             localZ > SIDE_LOCAL_Z_MIN;
-    return roofContact || sideContact;
-}
+static constexpr float BODY_FRICTION_MULTIPLIER = 1.05f;
+static constexpr float GROUND_NORMAL_Z_MIN = 0.55f;
+static constexpr float MIN_FORWARD_SPEED = 0.72f;
+static constexpr float MIN_LATERAL_SPEED = 0.20f;
+static constexpr float SPEED_RAMP = 0.85f;
+static constexpr float SLIP_RAMP = 0.45f;
+static constexpr float MAX_BLOWOVER_FORCE = 8.0f;
+static constexpr float SIDE_OFFSET = 0.85f;
+static constexpr float REAR_OFFSET = 0.65f;
+static constexpr float MIN_UP_AXIS_Z = 0.20f;
 
 DECL_HOOK(bool, PhysicalApplyFriction, void* self, float friction, ColPointSA* cp) {
-    if (self && cp && FindPlayerVehicleNative &&
-        FindPlayerVehicleNative(0, false) == self && IsBodyGroundContact(self, cp)) {
-        friction *= BODY_FRICTION_MULTIPLIER;
+    if (self && cp && FindPlayerVehicleNative && FindPlayerVehicleNative(0, false) == self) {
+        if (cp->normal.z > GROUND_NORMAL_Z_MIN)
+            sawGroundContact = true;
+
+        // Small increase only for roof/side contacts; don't increase general tire grip.
+        auto* bytes = reinterpret_cast<uint8_t*>(self);
+        MatrixSA* matrix = *reinterpret_cast<MatrixSA**>(bytes + MATRIX_PTR_OFFSET);
+        if (matrix && std::fabs(cp->normal.z) > GROUND_NORMAL_Z_MIN) {
+            const Vec3 rel = {cp->point.x-matrix->pos.x,
+                              cp->point.y-matrix->pos.y,
+                              cp->point.z-matrix->pos.z};
+            const float localX = Dot(rel, matrix->right);
+            const float localZ = Dot(rel, matrix->up);
+            if (localZ > 0.25f || (std::fabs(localX) > 0.70f && localZ > -0.12f))
+                friction *= BODY_FRICTION_MULTIPLIER;
+        }
     }
-    // No ApplyTurnForce call here: this hook can run repeatedly during collision solving.
     return PhysicalApplyFriction(self, friction, cp);
 }
 
 DECL_HOOK(void, AutomobileProcessControl, void* self) {
     AutomobileProcessControl(self);
-
-    if (!self || !FindPlayerVehicleNative || !ApplyTurnForceNative ||
+    if (!self || !FindPlayerVehicleNative || !ApplyForceNative ||
         FindPlayerVehicleNative(0, false) != self)
         return;
+
+    // Consume contact observed by the collision/friction callback. This prevents
+    // the rollover impulse from repeatedly firing while the car is freely airborne.
+    const bool grounded = sawGroundContact;
+    sawGroundContact = false;
+    if (!grounded) return;
 
     auto* bytes = reinterpret_cast<uint8_t*>(self);
     MatrixSA* matrix = *reinterpret_cast<MatrixSA**>(bytes + MATRIX_PTR_OFFSET);
     Vec3* velocity = reinterpret_cast<Vec3*>(bytes + MOVE_SPEED_OFFSET);
-    if (!matrix || !velocity || matrix->up.z < MIN_UP_AXIS_Z)
-        return;
+    if (!matrix || !velocity || matrix->up.z < MIN_UP_AXIS_Z) return;
 
-    const float forwardSpeed = std::fabs(Dot(*velocity, matrix->at));
-    const float lateralSpeed = std::fabs(Dot(*velocity, matrix->right));
-    if (forwardSpeed < MIN_FORWARD_SPEED || lateralSpeed < MIN_LATERAL_SPEED)
-        return;
+    const float forwardSpeed = Abs(Dot(*velocity, matrix->at));
+    const float lateralVelocity = Dot(*velocity, matrix->right);
+    const float lateralSpeed = Abs(lateralVelocity);
+    if (forwardSpeed < MIN_FORWARD_SPEED || lateralSpeed < MIN_LATERAL_SPEED) return;
 
     const float speedFactor = Clamp01((forwardSpeed - MIN_FORWARD_SPEED) / SPEED_RAMP);
     const float slipFactor = Clamp01((lateralSpeed - MIN_LATERAL_SPEED) / SLIP_RAMP);
     const float forceAmount = MAX_BLOWOVER_FORCE * speedFactor * slipFactor;
-    if (forceAmount < 1.0f)
-        return;
+    if (forceAmount < 0.5f) return;
 
-    // Apply a single bounded upward force at the rear offset once per control frame.
-    // This is separate from friction to avoid repeated impulses from collision contacts.
+    // Apply upward force on one side and toward the rear. The offset is transformed
+    // from vehicle-local axes into world axes, so the force creates roll torque.
+    const float side = (lateralVelocity >= 0.0f) ? -1.0f : 1.0f;
+    Vec3 offset = Add(Mul(matrix->right, side * SIDE_OFFSET),
+                      Mul(matrix->at, -REAR_OFFSET));
     const Vec3 force = {0.0f, 0.0f, forceAmount};
-    const Vec3 rearOffset = {0.0f, -REAR_OFFSET, REAR_UP_OFFSET};
-    ApplyTurnForceNative(self, force, rearOffset);
+    ApplyForceNative(self, force, offset, true);
 }
 
 ON_MOD_LOAD() {
@@ -121,9 +110,9 @@ ON_MOD_LOAD() {
 
     FindPlayerVehicleNative = reinterpret_cast<FindPlayerVehicleFn>(
         aml->GetSym(gtasaHandle, "_Z17FindPlayerVehicleib"));
-    ApplyTurnForceNative = reinterpret_cast<ApplyTurnForceFn>(
-        aml->GetSym(gtasaHandle, "_ZN9CPhysical14ApplyTurnForceE7CVectorS0_"));
-    if (!FindPlayerVehicleNative || !ApplyTurnForceNative) return;
+    ApplyForceNative = reinterpret_cast<ApplyForceFn>(
+        aml->GetSym(gtasaHandle, "_ZN9CPhysical10ApplyForceE7CVectorS0_b"));
+    if (!FindPlayerVehicleNative || !ApplyForceNative) return;
 
     HOOKSYM(PhysicalApplyFriction, gtasaHandle,
             "_ZN9CPhysical13ApplyFrictionEfR9CColPoint");
