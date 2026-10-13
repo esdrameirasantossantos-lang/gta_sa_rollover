@@ -1,155 +1,207 @@
+// ============================================================================
+// Realistic Rollover Physics — AML PSDK plugin para GTA San Andreas Android
+// ============================================================================
+// Problema que este plugin resolve:
+//   No GTA SA, quando um veiculo capota, a engine gira o corpo em torno do seu
+//   proprio eixo (m_vecTurnSpeed) mas praticamente nao transfere a velocidade
+//   linear (m_vecMoveSpeed) para fora do corpo durante o giro — o carro "roda
+//   no lugar" em vez de girar E deslizar ao mesmo tempo, como acontece em
+//   jogos com solver rigido-corpo mais completo (BeamNG, etc).
+//
+// Solucao:
+//   A cada frame de fisica, se o veiculo do jogador estiver:
+//     1) em contato com o chao (bOnSolidSurface)
+//     2) com inclinacao alta o suficiente pra ser considerado "capotando"
+//   entao:
+//     - aumentamos a velocidade angular (m_vecTurnSpeed) proporcionalmente a
+//       velocidade linear atual (quanto mais rapido, mais rapido capota)
+//     - reduzimos o "travamento" de atrito lateral multiplicando
+//       m_vecMoveSpeed por um fator de grip que depende da superficie
+//       (m_nContactSurface), permitindo o corpo deslizar enquanto gira
+//
+// Compilar: coloque esta pasta dentro de examples/game_sa/ no repo aml-psdk
+// e rode build.ps1 (ou ndk-build apontando pro Android.mk desta pasta).
+// Resultado: libPSDK_RealisticRollover.so (32-bit) — carregue via AML loader.
+// ============================================================================
+
 #include <mod/amlmod.h>
+#include <mod/logger.h>
+
 #include <aml-psdk/game_sa/Events.h>
 #include <aml-psdk/game_sa/entity/PlayerPed.h>
+#include <aml-psdk/game_sa/entity/Vehicle.h>
 #include <aml-psdk/game_sa/entity/Automobile.h>
-#include <aml-psdk/game_sa/entity/Physical.h>
+#include <aml-psdk/game_sa/enum/SurfaceType.h>
+#include <aml-psdk/game_sa/base/Timer.h>
+#include <aml-psdk/gta_base/Vector.h>
+#include <aml-psdk/game_sa/base/Matrix.h>
 #include <cmath>
 
-MYMOD(
-    net.psdk.realisticrollover,
-    Realistic Rollover,
-    1.0,
-    Esdra
-)
+MYMOD(net.rusjj.psdkexample.realisticrollover, Realistic Rollover Physics, 1.0, Claude)
 
-namespace Blowover
+// ----------------------------------------------------------------------------
+// Configuracao ajustavel
+// ----------------------------------------------------------------------------
+
+// Abaixo desse valor de GetUp().z o carro e considerado "capotando"
+// (1.0 = totalmente em pe, 0.0 = de lado, -1.0 = de cabeca pra baixo)
+static const float ROLLOVER_UP_THRESHOLD = 0.55f;
+
+// Quanto da velocidade linear vira velocidade angular extra por segundo.
+// Valores maiores = capota mais rapido em alta velocidade.
+static const float SPIN_GAIN = 0.11f;
+
+// Limite maximo de velocidade angular extra que podemos injetar (rad/s),
+// pra nao deixar o carro girando feito pião infinito.
+static const float MAX_EXTRA_SPIN = 6.0f;
+
+// Tabela de grip por superficie (1.0 = trava total / sem deslizar,
+// 0.0 = sem atrito nenhum / desliza livre). Usada so durante o capotamento.
+static float GetSurfaceGrip(unsigned char surface)
 {
-    constexpr float STRENGTH = 0.50f;
-
-    constexpr float MIN_SPEED = 0.25f;
-    constexpr float LATERAL_THRESHOLD = 0.08f;
-
-    // Intensidade do atrito e da rolagem artificiais
-    constexpr float FRICTION_FACTOR = 0.80f;
-    constexpr float ROLL_FACTOR = 0.65f;
-    constexpr float LIFT_FACTOR = 0.50f;
-
-    constexpr float REAR_DISTANCE = 1.5f;
-    constexpr float SIDE_DISTANCE = 0.9f;
-
-    inline float Clamp(float value, float minimum, float maximum)
+    switch (surface)
     {
-        return value < minimum ? minimum :
-               value > maximum ? maximum : value;
-    }
+        case SURFACE_TARMAC:
+        case SURFACE_TARMAC_FUCKED:
+        case SURFACE_TARMAC_REALLYFUCKED:
+        case SURFACE_PAVEMENT:
+        case SURFACE_PAVEMENT_FUCKED:
+        case SURFACE_FUCKED_CONCRETE:
+        case SURFACE_PAINTED_GROUND:
+            return 0.80f; // asfalto/concreto: desliza pouco, trava mais rapido
 
-    inline float Dot(const CVector& a, const CVector& b)
-    {
-        return a.x * b.x + a.y * b.y + a.z * b.z;
-    }
+        case SURFACE_GRAVEL:
+            return 0.55f; // cascalho: grip medio-baixo
 
-    inline CVector Scale(const CVector& v, float s)
-    {
-        return CVector(v.x * s, v.y * s, v.z * s);
-    }
+        case SURFACE_GRASS_SHORT_LUSH:
+        case SURFACE_GRASS_MEDIUM_LUSH:
+        case SURFACE_GRASS_LONG_LUSH:
+        case SURFACE_GRASS_SHORT_DRY:
+        case SURFACE_GRASS_MEDIUM_DRY:
+        case SURFACE_GRASS_LONG_DRY:
+        case SURFACE_GOLFGRASS_ROUGH:
+        case SURFACE_GOLFGRASS_SMOOTH:
+            return 0.35f; // grama: desliza bastante
 
-    inline CVector Add(const CVector& a, const CVector& b)
-    {
-        return CVector(a.x + b.x, a.y + b.y, a.z + b.z);
+        case SURFACE_STEEP_SLIDYGRASS:
+        case SURFACE_STEEP_CLIFF:
+            return 0.20f; // terreno muito escorregadio
+
+        default:
+            return 0.55f; // fallback generico
     }
 }
+
+// ----------------------------------------------------------------------------
+// Logica principal (roda todo frame de fisica do jogo)
+// ----------------------------------------------------------------------------
+
+static void ProcessRealisticRollover(CVehicle* veh, float dt)
+{
+    if (!veh) return;
+
+    CPhysical* phys = (CPhysical*)veh; // CVehicle herda de CPhysical
+
+    // So mexe se o veiculo estiver tocando o chao — nao queremos afetar
+    // veiculos no ar (fisica de voo/queda fica como o jogo ja faz).
+    if (!phys->bOnSolidSurface) return;
+
+    CMatrix* mat = veh->GetMatrix();
+    if (!mat) return;
+
+    float upZ = mat->GetUp().z;
+
+    // So aplica o efeito quando o carro esta de fato capotando/na lateral
+    if (upZ > ROLLOVER_UP_THRESHOLD) return;
+
+    // Velocidade linear atual (unidades do jogo, nao km/h)
+    CVector& moveSpeed = phys->m_vecMoveSpeed;
+    float linSpeed = moveSpeed.Magnitude();
+    if (linSpeed < 0.002f) return; // parado, nao ha o que simular
+
+    float grip = GetSurfaceGrip(phys->m_nContactSurface);
+
+    // --- 1) Giro proporcional a velocidade --------------------------------
+    // Quanto mais rapido o carro esta indo, mais rapido ele deve capotar.
+    // Adicionamos a velocidade angular na direcao que o jogo ja escolheu
+    // (preserva o sentido do giro calculado pela engine), so amplificando.
+    CVector& turnSpeed = phys->m_vecTurnSpeed;
+    float curSpin = turnSpeed.Magnitude();
+
+    float desiredExtraSpin = linSpeed * SPIN_GAIN;
+    if (desiredExtraSpin > MAX_EXTRA_SPIN) desiredExtraSpin = MAX_EXTRA_SPIN;
+
+    if (curSpin > 0.001f)
+    {
+        // normaliza o eixo de giro atual e injeta spin extra nesse mesmo eixo
+        float invCur = 1.0f / curSpin;
+        CVector spinAxis(turnSpeed.x * invCur, turnSpeed.y * invCur, turnSpeed.z * invCur);
+
+        float addAmount = desiredExtraSpin * dt * 30.0f; // normalizado p/ ~30fps de referencia
+        turnSpeed.x += spinAxis.x * addAmount;
+        turnSpeed.y += spinAxis.y * addAmount;
+        turnSpeed.z += spinAxis.z * addAmount;
+    }
+    else
+    {
+        // engine ainda nao decidiu eixo de giro (ex.: acabou de bater):
+        // usa o eixo perpendicular entre a direcao do movimento e o "up" do mundo,
+        // que e o eixo natural de capotamento (tomba pra frente/lado do impacto)
+        CVector worldUp(0.0f, 0.0f, 1.0f);
+        CVector moveDir(moveSpeed.x / linSpeed, moveSpeed.y / linSpeed, moveSpeed.z / linSpeed);
+
+        CVector axis(
+            moveDir.y * worldUp.z - moveDir.z * worldUp.y,
+            moveDir.z * worldUp.x - moveDir.x * worldUp.z,
+            moveDir.x * worldUp.y - moveDir.y * worldUp.x
+        );
+        float axisLen = axis.Magnitude();
+        if (axisLen > 0.001f)
+        {
+            float inv = 1.0f / axisLen;
+            float addAmount = desiredExtraSpin * dt * 30.0f * 0.5f;
+            turnSpeed.x += axis.x * inv * addAmount;
+            turnSpeed.y += axis.y * inv * addAmount;
+            turnSpeed.z += axis.z * inv * addAmount;
+        }
+    }
+
+    // --- 2) Deslize lateral durante o giro ---------------------------------
+    // Em vez de deixar o atrito nativo "grudar" o corpo no chao instantaneamente,
+    // reduzimos a velocidade linear de forma gradual (proporcional ao grip da
+    // superficie), simulando o corpo escorregando enquanto gira — como um carro
+    // capotando em alta velocidade realmente faz.
+    float frictionDrop = (1.0f - grip) * dt * 1.6f; // quanto MENOS grip, MENOS reducao = mais deslize
+    float keepFactor = 1.0f - (grip * dt * 0.9f) + frictionDrop;
+
+    // clamp de seguranca pra nao inverter velocidade nem criar energia do nada
+    if (keepFactor > 1.0f) keepFactor = 1.0f;
+    if (keepFactor < 0.85f) keepFactor = 0.85f;
+
+    moveSpeed.x *= keepFactor;
+    moveSpeed.y *= keepFactor;
+    moveSpeed.z *= keepFactor; // nao mexe tanto no Z pra nao estranhar a gravidade
+}
+
+// ----------------------------------------------------------------------------
+// Entry point do mod
+// ----------------------------------------------------------------------------
 
 ON_MOD_LOAD()
 {
     Events::gameProcessEvent += []()
     {
         CPlayerPed* player = FindPlayerPed(-1);
-        if (!player)
-            return;
+        if (!player) return;
 
-        CVehicle* vehicle = FindPlayerVehicle(-1, false);
-        if (!vehicle || !vehicle->IsAutomobile())
-            return;
+        CVehicle* veh = player->m_pVehicle;
+        if (!veh) return;
 
-        CAutomobile* car = vehicle->AsAutomobile();
+        float dt = CTimer::GetTimeStepInSeconds();
+        if (dt <= 0.0f || dt > 0.2f) dt = 1.0f / 30.0f; // protege contra spikes/pause
 
-        const CVector velocity = car->m_vecMoveSpeed;
-        const float speed = velocity.Magnitude();
-
-        if (speed < Blowover::MIN_SPEED)
-            return;
-
-        const CVector right = car->GetRightDirection();
-        const CVector forward = car->GetTopDirection();
-        const CVector up = car->GetAtDirection();
-
-        const float lateralSpeed = Blowover::Dot(velocity, right);
-        const float lateral = std::fabs(lateralSpeed);
-
-        const float speedFactor = Blowover::Clamp(
-            (speed - Blowover::MIN_SPEED) / 0.50f,
-            0.0f,
-            1.0f
-        );
-
-        const float slipFactor = Blowover::Clamp(
-            lateral * 3.0f,
-            0.0f,
-            1.0f
-        );
-
-        const float strength =
-            Blowover::STRENGTH * speedFactor * slipFactor;
-
-        if (strength <= 0.0f)
-            return;
-
-        // Ponto traseiro relativo à orientação do veículo.
-        const CVector rearOffset = Blowover::Scale(
-            forward, -Blowover::REAR_DISTANCE
-        );
-
-        // Elevação adicional na traseira.
-        const float liftMagnitude =
-            speed * speed * Blowover::LIFT_FACTOR * strength;
-
-        const CVector liftForce = Blowover::Scale(up, liftMagnitude);
-
-        car->ApplyForce(liftForce, rearOffset, true);
-
-        // Torque de rolagem gerado por uma força vertical
-        // aplicada fora do centro da carroceria.
-        const float rollDirection =
-            lateralSpeed >= 0.0f ? -1.0f : 1.0f;
-
-        const CVector sideOffset = Blowover::Scale(
-            right, Blowover::SIDE_DISTANCE * rollDirection
-        );
-
-        const float rollMagnitude =
-            speed * lateral * Blowover::ROLL_FACTOR * strength;
-
-        const CVector rollForce = Blowover::Scale(up, rollMagnitude);
-
-        car->ApplyTurnForce(rollForce, sideOffset);
-
-        // Atrito artificial estimado durante grande inclinação.
-        // GetUp().z baixo indica que o carro está muito inclinado.
-        const float tilt = Blowover::Clamp(
-            1.0f - std::fabs(up.z),
-            0.0f,
-            1.0f
-        );
-
-        if (tilt > 0.35f)
-        {
-            // Componente lateral da velocidade.
-            const CVector lateralVelocity =
-                Blowover::Scale(right, lateralSpeed);
-
-            // Força contrária ao deslizamento lateral.
-            const CVector frictionForce = Blowover::Scale(
-                lateralVelocity,
-                -Blowover::FRICTION_FACTOR *
-                strength * tilt
-            );
-
-            // Braço de alavanca lateral para adicionar rotação.
-            const CVector frictionOffset = Blowover::Scale(
-                right, rollDirection * Blowover::SIDE_DISTANCE
-            );
-
-            car->ApplyForce(frictionForce, frictionOffset, true);
-        }
+        ProcessRealisticRollover(veh, dt);
     };
+
+    Log("[RealisticRollover] Plugin carregado com sucesso.");
 }
