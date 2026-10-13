@@ -1,43 +1,60 @@
 #include <mod/amlmod.h>
+#include <mod/logger.h>
+
 #include <cmath>
 #include <cstdint>
 
-MYMOD(net.esdra.realisticrollover, Realistic Rollover, 0.8, Esdra)
+MYMOD(net.esdra.realisticrollover, Realistic Rollover, 0.9, Esdra)
 
 BEGIN_DEPLIST()
     ADD_DEPENDENCY_VER(net.rusjj.aml, 1.3.0)
 END_DEPLIST()
 
+// GTA SA Android v2.00 / ARMv7.
+// Experimental source: native body-contact friction plus a bounded turn force.
+// Compile and test separately; this is not a tested .so.
+
 struct Vec3 {
     float x, y, z;
 };
 
+static inline Vec3 Add(Vec3 a, Vec3 b) {
+    return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+static inline Vec3 Sub(Vec3 a, Vec3 b) {
+    return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+static inline Vec3 Mul(Vec3 a, float s) {
+    return {a.x * s, a.y * s, a.z * s};
+}
 static inline float Dot(Vec3 a, Vec3 b) {
-    return a.x*b.x + a.y*b.y + a.z*b.z;
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+static inline float Len2(Vec3 a) {
+    return Dot(a, a);
+}
+static inline float Clamp(float v, float lo, float hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
 }
 
-static inline float Clamp01(float x) {
-    if (x < 0.0f) return 0.0f;
-    if (x > 1.0f) return 1.0f;
-    return x;
-}
-
+// CMatrix / RwMatrix basis order: right, up, at, position.
 struct MatrixSA {
-    Vec3 right;
-    uint32_t flagsRight;
-
-    Vec3 forward;
-    uint32_t flagsForward;
-
-    Vec3 up;
-    uint32_t flagsUp;
-
-    Vec3 pos;
-    uint32_t flagsPos;
+    Vec3 right; uint32_t flagsRight;
+    Vec3 up;    uint32_t flagsUp;
+    Vec3 at;    uint32_t flagsAt;
+    Vec3 pos;   uint32_t flagsPos;
 };
 
-using FindPlayerVehicleFn = void* (*)(int, bool);
-using ApplyTurnForceFn = void (*)(void*, Vec3, Vec3);
+// CColPoint offsets confirmed from the game's ApplyFriction instructions.
+struct ColPointSA {
+    Vec3 point;       // +0x00, world-space contact point
+    float depth;      // +0x0C
+    Vec3 normal;      // +0x10, world-space contact normal
+};
+
+using FindPlayerVehicleFn = void* (*)(int playerId, bool includeRemote);
+// Binary disassembly confirms argument order: world contact point, then force.
+using ApplyTurnForceFn = void (*)(void* physical, Vec3 worldPoint, Vec3 force);
 
 static FindPlayerVehicleFn FindPlayerVehicleNative = nullptr;
 static ApplyTurnForceFn ApplyTurnForceNative = nullptr;
@@ -45,256 +62,110 @@ static ApplyTurnForceFn ApplyTurnForceNative = nullptr;
 static constexpr uintptr_t MATRIX_PTR_OFFSET = 0x14;
 static constexpr uintptr_t MOVE_SPEED_OFFSET = 0x48;
 
-// Blowover
-static constexpr float MIN_FORWARD_SPEED = 0.78f;
-static constexpr float MIN_LATERAL_SPEED = 0.24f;
-static constexpr float SPEED_RAMP = 0.95f;
-static constexpr float SLIP_RAMP = 0.55f;
-static constexpr float MAX_IMPULSE = 150.0f;
-static constexpr float REAR_OFFSET = 1.45f;
-static constexpr float REAR_UP_OFFSET = 0.10f;
-static constexpr float MIN_UP_AXIS_Z = 0.70f;
+// Start conservatively. This affects only classified roof/side body contacts.
+static constexpr float BODY_FRICTION_MULTIPLIER = 1.30f;
+static constexpr float ROLL_GAIN = 1.50f;
+static constexpr float MAX_ROLL_FORCE = 0.45f;
+static constexpr float MIN_FORCE_FOR_ROLL = 0.055f;
+static constexpr float GROUND_NORMAL_Z_MIN = 0.65f;
+static constexpr float ROOF_LOCAL_Z_MIN = 0.25f;
+static constexpr float SIDE_LOCAL_X_MIN = 0.70f;
+static constexpr float SIDE_LOCAL_Z_MIN = -0.12f;
 
-// Atrito da carroceria
-static constexpr float BODY_FRICTION_MULTIPLIER = 2.2f;
-static constexpr float BODY_CONTACT_MIN_HEIGHT = 0.20f;
-static constexpr float BODY_TIPPED_LIMIT = 0.65f;
-
-// Evita multiplicar o atrito duas vezes se os hooks
-// forem chamados um dentro do outro.
-static thread_local bool g_insideFrictionHook = false;
-
-static MatrixSA* GetMatrix(void* entity) {
-    if (!entity)
-        return nullptr;
-
-    auto* bytes = reinterpret_cast<uint8_t*>(entity);
-
-    return *reinterpret_cast<MatrixSA**>(
-        bytes + MATRIX_PTR_OFFSET
-    );
-}
-
-// Esta verificação depende de CColPoint começar com
-// a posição mundial do contato. Isso precisa ser
-// confirmado para a versão exata do jogo.
-static bool IsBodyContact(void* vehicle, void* colPoint) {
-    if (!vehicle || !colPoint)
+static bool IsBodyGroundContact(void* self, const ColPointSA* cp,
+                                MatrixSA*& matrixOut, Vec3*& moveSpeedOut,
+                                float& localXOut, float& localZOut,
+                                bool& roofOut) {
+    if (!self || !cp)
         return false;
 
-    MatrixSA* matrix = GetMatrix(vehicle);
-
-    if (!matrix)
+    // Ignore walls/near-vertical surfaces: this effect is for body-to-ground contact.
+    if (std::fabs(cp->normal.z) < GROUND_NORMAL_Z_MIN)
         return false;
 
-    // Não aplicar o efeito enquanto o veículo está
-    // aproximadamente na posição normal.
-    if (matrix->up.z >= BODY_TIPPED_LIMIT)
+    auto* bytes = reinterpret_cast<uint8_t*>(self);
+    matrixOut = *reinterpret_cast<MatrixSA**>(bytes + MATRIX_PTR_OFFSET);
+    moveSpeedOut = reinterpret_cast<Vec3*>(bytes + MOVE_SPEED_OFFSET);
+    if (!matrixOut || !moveSpeedOut)
         return false;
 
-    const Vec3 contact =
-        *reinterpret_cast<Vec3*>(colPoint);
+    const Vec3 relative = Sub(cp->point, matrixOut->pos);
+    localXOut = Dot(relative, matrixOut->right);
+    localZOut = Dot(relative, matrixOut->up);
 
-    const Vec3 relative = {
-        contact.x - matrix->pos.x,
-        contact.y - matrix->pos.y,
-        contact.z - matrix->pos.z
-    };
+    roofOut = localZOut > ROOF_LOCAL_Z_MIN;
+    const bool sideBodyContact =
+        std::fabs(localXOut) > SIDE_LOCAL_X_MIN &&
+        localZOut > SIDE_LOCAL_Z_MIN;
 
-    // Distância do contato ao longo do eixo vertical
-    // local do veículo.
-    const float localHeight = Dot(relative, matrix->up);
-
-    return localHeight > BODY_CONTACT_MIN_HEIGHT;
+    return roofOut || sideBodyContact;
 }
 
-static float AdjustBodyFriction(
-    void* vehicle,
-    float friction,
-    void* colPoint
-) {
-    if (g_insideFrictionHook)
-        return friction;
+// This overload returns bool in the supplied game binary (it ends with r0=0/1).
+DECL_HOOK(bool, PhysicalApplyFriction, void* self, float friction, ColPointSA* cp) {
+    MatrixSA* matrix = nullptr;
+    Vec3* moveSpeed = nullptr;
+    float localX = 0.0f;
+    float localZ = 0.0f;
+    bool roofContact = false;
+    bool bodyContact = false;
 
-    if (IsBodyContact(vehicle, colPoint))
-        return friction * BODY_FRICTION_MULTIPLIER;
-
-    return friction;
-}
-
-// Sobrecarga: ApplyFriction(float, CColPoint&)
-DECL_HOOK(
-    void,
-    PhysicalApplyFrictionSingle,
-    void* self,
-    float friction,
-    void* colPoint
-) {
-    float adjusted = friction;
-
-    void* playerVehicle = nullptr;
-
-    if (FindPlayerVehicleNative)
-        playerVehicle = FindPlayerVehicleNative(0, false);
-
-    if (self && self == playerVehicle) {
-        adjusted = AdjustBodyFriction(
-            self, friction, colPoint
-        );
+    if (self && cp && FindPlayerVehicleNative &&
+        FindPlayerVehicleNative(0, false) == self) {
+        bodyContact = IsBodyGroundContact(self, cp, matrix, moveSpeed,
+                                           localX, localZ, roofContact);
+        if (bodyContact)
+            friction *= BODY_FRICTION_MULTIPLIER;
     }
 
-    const bool previous = g_insideFrictionHook;
-    g_insideFrictionHook = true;
+    // Run the original solver with adjusted friction and preserve its bool result.
+    const bool result = PhysicalApplyFriction(self, friction, cp);
 
-    PhysicalApplyFrictionSingle(
-        self, adjusted, colPoint
-    );
+    // Add a small, bounded roll contribution only at roof contacts.
+    // Side contacts get the native friction increase but no speculative extra torque.
+    if (bodyContact && roofContact && result && matrix && moveSpeed &&
+        ApplyTurnForceNative) {
+        const float lateralSpeed = Dot(*moveSpeed, matrix->right);
+        Vec3 force = Mul(matrix->right, -lateralSpeed * ROLL_GAIN);
 
-    g_insideFrictionHook = previous;
-}
+        // Keep the added force tangent to the contact plane.
+        const float normal2 = Len2(cp->normal);
+        if (normal2 > 0.0001f)
+            force = Sub(force, Mul(cp->normal,
+                                  Dot(force, cp->normal) / normal2));
 
-// Sobrecarga: ApplyFriction(CPhysical*, float, CColPoint&)
-DECL_HOOK(
-    void,
-    PhysicalApplyFrictionPair,
-    void* self,
-    void* other,
-    float friction,
-    void* colPoint
-) {
-    float adjusted = friction;
-
-    void* playerVehicle = nullptr;
-
-    if (FindPlayerVehicleNative)
-        playerVehicle = FindPlayerVehicleNative(0, false);
-
-    if (playerVehicle) {
-        if (self == playerVehicle || other == playerVehicle) {
-            adjusted = AdjustBodyFriction(
-                playerVehicle, friction, colPoint
-            );
+        const float force2 = Len2(force);
+        if (force2 > MIN_FORCE_FOR_ROLL * MIN_FORCE_FOR_ROLL) {
+            const float forceLength = std::sqrt(force2);
+            if (forceLength > MAX_ROLL_FORCE)
+                force = Mul(force, MAX_ROLL_FORCE / forceLength);
+            ApplyTurnForceNative(self, cp->point, force);
         }
     }
 
-    const bool previous = g_insideFrictionHook;
-    g_insideFrictionHook = true;
-
-    PhysicalApplyFrictionPair(
-        self, other, adjusted, colPoint
-    );
-
-    g_insideFrictionHook = previous;
+    return result;
 }
 
-// Blowover
-DECL_HOOK(void, AutomobileProcessControl, void* self)
-{
-    AutomobileProcessControl(self);
+ON_MOD_LOAD() {
+    logger->SetTag("Realistic Rollover");
 
-    if (!self || !FindPlayerVehicleNative ||
-        !ApplyTurnForceNative)
+    void* gtasaHandle = aml->GetLibHandle("libGTASA.so");
+    if (!gtasaHandle) {
+        logger->Error("libGTASA.so not found");
         return;
+    }
 
-    void* vehicle = FindPlayerVehicleNative(0, false);
+    FindPlayerVehicleNative = reinterpret_cast<FindPlayerVehicleFn>(
+        aml->GetSym(gtasaHandle, "_Z17FindPlayerVehicleib"));
+    ApplyTurnForceNative = reinterpret_cast<ApplyTurnForceFn>(
+        aml->GetSym(gtasaHandle, "_ZN9CPhysical14ApplyTurnForceE7CVectorS0_"));
 
-    if (!vehicle || vehicle != self)
+    if (!FindPlayerVehicleNative || !ApplyTurnForceNative) {
+        logger->Error("Required GTA SA v2.00 symbols not found");
         return;
+    }
 
-    MatrixSA* matrix = GetMatrix(self);
-
-    auto* bytes = reinterpret_cast<uint8_t*>(self);
-
-    Vec3* velocity = reinterpret_cast<Vec3*>(
-        bytes + MOVE_SPEED_OFFSET
-    );
-
-    if (!matrix || !velocity)
-        return;
-
-    if (matrix->up.z < MIN_UP_AXIS_Z)
-        return;
-
-    const float forwardSpeed =
-        std::fabs(Dot(*velocity, matrix->forward));
-
-    const float lateralSpeed =
-        std::fabs(Dot(*velocity, matrix->right));
-
-    if (forwardSpeed < MIN_FORWARD_SPEED ||
-        lateralSpeed < MIN_LATERAL_SPEED)
-        return;
-
-    const float speedFactor = Clamp01(
-        (forwardSpeed - MIN_FORWARD_SPEED) / SPEED_RAMP
-    );
-
-    const float slipFactor = Clamp01(
-        (lateralSpeed - MIN_LATERAL_SPEED) / SLIP_RAMP
-    );
-
-    const float impulse =
-        MAX_IMPULSE * speedFactor * slipFactor;
-
-    if (impulse < 1.0f)
-        return;
-
-    const Vec3 upwardForce = {
-        0.0f, 0.0f, impulse
-    };
-
-    const Vec3 rearOffset = {
-        0.0f, -REAR_OFFSET, REAR_UP_OFFSET
-    };
-
-    ApplyTurnForceNative(
-        self, upwardForce, rearOffset
-    );
-}
-
-ON_MOD_LOAD()
-{
-    void* gtasaHandle =
-        aml->GetLibHandle("libGTASA.so");
-
-    if (!gtasaHandle)
-        return;
-
-    FindPlayerVehicleNative =
-        reinterpret_cast<FindPlayerVehicleFn>(
-            aml->GetSym(
-                gtasaHandle,
-                "_Z17FindPlayerVehicleib"
-            )
-        );
-
-    ApplyTurnForceNative =
-        reinterpret_cast<ApplyTurnForceFn>(
-            aml->GetSym(
-                gtasaHandle,
-                "_ZN9CPhysical14ApplyTurnForceE7CVectorS0_"
-            )
-        );
-
-    if (!FindPlayerVehicleNative ||
-        !ApplyTurnForceNative)
-        return;
-
-    HOOKSYM(
-        PhysicalApplyFrictionSingle,
-        gtasaHandle,
-        "_ZN9CPhysical13ApplyFrictionEfR9CColPoint"
-    );
-
-    HOOKSYM(
-        PhysicalApplyFrictionPair,
-        gtasaHandle,
-        "_ZN9CPhysical13ApplyFrictionEPS_fR9CColPoint"
-    );
-
-    HOOKSYM(
-        AutomobileProcessControl,
-        gtasaHandle,
-        "_ZN11CAutomobile14ProcessControlEv"
-    );
+    HOOKSYM(PhysicalApplyFriction, gtasaHandle,
+            "_ZN9CPhysical13ApplyFrictionEfR9CColPoint");
+    logger->Info("Hook installed: roof/side contact friction prototype");
 }
