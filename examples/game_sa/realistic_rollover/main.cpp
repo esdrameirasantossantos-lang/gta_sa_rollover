@@ -9,9 +9,8 @@ BEGIN_DEPLIST()
 END_DEPLIST()
 
 // GTA SA Android 2.00 / armeabi-v7a prototype.
-// This pass targets the missing rear-lift torque. It deliberately does NOT
-// alter native friction yet; body-contact friction must be added separately
-// after the collision point classification is verified.
+// This pass corrects the rear-lift torque and speed thresholds. Native body-contact
+// friction is NOT implemented in this file yet.
 
 struct Vec3 {
     float x, y, z;
@@ -36,7 +35,7 @@ struct MatrixSA {
 };
 
 using FindPlayerVehicleFn = void* (*)(int playerId, bool includeRemote);
-using ApplyTurnForceFn = void (*)(void* physical, Vec3 localPoint, Vec3 worldImpulse);
+using ApplyTurnForceFn = void (*)(void* physical, Vec3 worldPoint, Vec3 worldForce);
 
 static FindPlayerVehicleFn FindPlayerVehicleNative = nullptr;
 static ApplyTurnForceFn ApplyTurnForceNative = nullptr;
@@ -47,15 +46,14 @@ static constexpr uintptr_t MATRIX_PTR_OFFSET = 0x14;
 static constexpr uintptr_t MOVE_SPEED_OFFSET = 0x48;
 
 // Blowover tuning. GTA velocity is in game units/frame, not km/h.
-static constexpr float MIN_FORWARD_SPEED = 0.48f;
-static constexpr float MIN_LATERAL_SPEED = 0.12f;
-static constexpr float SPEED_RAMP = 1.20f;
-static constexpr float SLIP_RAMP = 0.38f;
-static constexpr float BASE_IMPULSE = 28.0f;
-static constexpr float MAX_IMPULSE = 220.0f;
-static constexpr float REAR_LOCAL_Y = -1.45f;
-static constexpr float REAR_LOCAL_Z = 0.10f;
-static constexpr float MIN_UP_AXIS_Z = 0.45f;
+static constexpr float MIN_FORWARD_SPEED = 0.78f;
+static constexpr float MIN_LATERAL_SPEED = 0.24f;
+static constexpr float SPEED_RAMP = 0.95f;
+static constexpr float SLIP_RAMP = 0.55f;
+static constexpr float MAX_IMPULSE = 150.0f;
+static constexpr float REAR_OFFSET = 1.45f;
+static constexpr float REAR_UP_OFFSET = 0.10f;
+static constexpr float MIN_UP_AXIS_Z = 0.70f;
 
 DECL_HOOK(void, AutomobileProcessControl, void* self)
 {
@@ -90,15 +88,23 @@ DECL_HOOK(void, AutomobileProcessControl, void* self)
     const float speedFactor = Clamp01((forwardSpeed - MIN_FORWARD_SPEED) / SPEED_RAMP);
     const float slipFactor = Clamp01((lateralSpeed - MIN_LATERAL_SPEED) / SLIP_RAMP);
 
-    // A vertical impulse at a point behind the centre of mass produces pitch
-    // torque that lifts the rear. ApplyTurnForce expects a vehicle-local point
-    // as its first vector and a world-space impulse vector as its second.
-    float impulse = BASE_IMPULSE + (MAX_IMPULSE - BASE_IMPULSE) * speedFactor * slipFactor;
-    if (impulse > MAX_IMPULSE) impulse = MAX_IMPULSE;
+    // No base impulse: barely crossing the thresholds must not launch the car.
+    // The force increases only when BOTH forward speed and lateral slip increase.
+    const float impulse = MAX_IMPULSE * speedFactor * slipFactor;
+    if (impulse < 1.0f)
+        return;
 
-    const Vec3 rearPoint = {0.0f, REAR_LOCAL_Y, REAR_LOCAL_Z};
-    const Vec3 upwardImpulse = {0.0f, 0.0f, impulse};
-    ApplyTurnForceNative(self, rearPoint, upwardImpulse);
+    // IMPORTANT: ApplyTurnForce expects a WORLD-SPACE point, not a local offset.
+    // Convert a point behind the car's centre into world coordinates.
+    const Vec3 rearPoint = {
+        matrix->pos.x - matrix->forward.x * REAR_OFFSET + matrix->up.x * REAR_UP_OFFSET,
+        matrix->pos.y - matrix->forward.y * REAR_OFFSET + matrix->up.y * REAR_UP_OFFSET,
+        matrix->pos.z - matrix->forward.z * REAR_OFFSET + matrix->up.z * REAR_UP_OFFSET
+    };
+
+    // An upward force at the rear creates pitch torque to lift the rear end.
+    const Vec3 upwardForce = {0.0f, 0.0f, impulse};
+    ApplyTurnForceNative(self, rearPoint, upwardForce);
 }
 
 ON_MOD_LOAD()
