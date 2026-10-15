@@ -10,6 +10,10 @@ BEGIN_DEPLIST()
     ADD_DEPENDENCY_VER(net.rusjj.aml, 1.3.0)
 END_DEPLIST()
 
+using FindPlayerVehicleFn = CVehicle* (*)(int, bool);
+
+static FindPlayerVehicleFn FindPlayerVehicleNative = nullptr;
+
 static bool g_groundContact = false;
 static int g_cooldown = 0;
 
@@ -35,14 +39,17 @@ static float Abs(float x)
 DECL_HOOK(bool, PhysicalApplyFriction,
     void* self, float friction, CColPoint& cp)
 {
-    CAutomobile* car =
-        (CAutomobile*)FindPlayerVehicle(0, false);
+    if (!FindPlayerVehicleNative)
+        return PhysicalApplyFriction(self, friction, cp);
 
-    if (car && self == car)
+    CVehicle* playerVehicle = FindPlayerVehicleNative(0, false);
+
+    if (playerVehicle && self == playerVehicle)
     {
         if (cp.m_vecNormal.z > 0.55f)
             g_groundContact = true;
 
+        CAutomobile* car = (CAutomobile*)playerVehicle;
         CMatrix* matrix = car->m_matrix;
 
         if (matrix)
@@ -94,10 +101,10 @@ DECL_HOOK(void, AutomobileProcessControl, CAutomobile* car)
 {
     AutomobileProcessControl(car);
 
-    if (!car)
+    if (!car || !FindPlayerVehicleNative)
         return;
 
-    if (FindPlayerVehicle(0, false) != car)
+    if (FindPlayerVehicleNative(0, false) != car)
         return;
 
     bool grounded = g_groundContact;
@@ -113,7 +120,6 @@ DECL_HOOK(void, AutomobileProcessControl, CAutomobile* car)
     if (!matrix)
         return;
 
-    // Evita aplicar o efeito quando o carro já está muito tombado.
     if (matrix->up.z < 0.20f || matrix->up.z > 0.94f)
         return;
 
@@ -150,7 +156,6 @@ DECL_HOOK(void, AutomobileProcessControl, CAutomobile* car)
 
     float side = lateralVelocity >= 0.0f ? -1.0f : 1.0f;
 
-    // Deslocamento relativo ao carro, não posição absoluta no mundo.
     CVector offset(
         matrix->right.x * side * SIDE_OFFSET -
             matrix->at.x * REAR_OFFSET,
@@ -173,7 +178,12 @@ ON_MOD_LOAD()
     if (!handle)
         return;
 
-    if (!aml->GetSym(handle, "_Z17FindPlayerVehicleib"))
+    FindPlayerVehicleNative =
+        (FindPlayerVehicleFn)aml->GetSym(
+            handle, "_Z17FindPlayerVehicleib"
+        );
+
+    if (!FindPlayerVehicleNative)
         return;
 
     HOOKSYM(
