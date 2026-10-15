@@ -1,9 +1,8 @@
+
 #include <mod/amlmod.h>
-#include <aml-psdk/game_sa/Physical.h>
-#include <aml-psdk/game_sa/Automobile.h>
-#include <aml-psdk/game_sa/ColModel.h>
+#include <aml-psdk/game_sa/entity/Automobile.h>
+#include <aml-psdk/game_sa/base/ColModel.h>
 #include <cmath>
-#include <cstdint>
 
 MYMOD(net.esdra.realisticrollover, Realistic Rollover, 1.3, Esdra)
 
@@ -11,185 +10,181 @@ BEGIN_DEPLIST()
     ADD_DEPENDENCY_VER(net.rusjj.aml, 1.3.0)
 END_DEPLIST()
 
-static inline float Dot3(
-    float ax, float ay, float az,
-    float bx, float by, float bz)
-{
-    return ax * bx + ay * by + az * bz;
-}
+static bool g_groundContact = false;
+static int g_cooldown = 0;
 
-static inline float Clamp01(float x)
+static constexpr float BODY_FRICTION = 1.12f;
+static constexpr float MIN_FORWARD = 0.45f;
+static constexpr float MIN_LATERAL = 0.12f;
+static constexpr float SPEED_RAMP = 1.10f;
+static constexpr float SLIP_RAMP = 0.65f;
+static constexpr float MAX_FORCE = 12.0f;
+static constexpr float SIDE_OFFSET = 0.95f;
+static constexpr float REAR_OFFSET = 0.35f;
+
+static float Clamp01(float x)
 {
     return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
 }
 
-static inline float AbsF(float x)
+static float Abs(float x)
 {
     return std::fabs(x);
 }
 
-// Configuração do capotamento.
-static constexpr float MIN_FORWARD_SPEED = 0.30f;
-static constexpr float MIN_LATERAL_SPEED = 0.10f;
-
-static constexpr float SPEED_RAMP = 1.00f;
-static constexpr float SLIP_RAMP = 0.55f;
-
-// Aumente para um capotamento mais forte.
-static constexpr float MAX_BLOWOVER_FORCE = 45.0f;
-
-static constexpr float SIDE_OFFSET = 1.00f;
-static constexpr float REAR_OFFSET = 0.25f;
-
-static constexpr float MIN_UP_AXIS_Z = 0.20f;
-static constexpr float MAX_UPRIGHT_AXIS_Z = 0.96f;
-
-static constexpr float MIN_FORCE = 1.0f;
-static constexpr int FORCE_COOLDOWN = 5;
-
-using FindPlayerVehicleFn = void* (*)(int, bool);
-
-static FindPlayerVehicleFn FindPlayerVehicleNative = nullptr;
-
-static bool sawGroundContact = false;
-static int forceCooldown = 0;
-
 DECL_HOOK(bool, PhysicalApplyFriction,
-          void* self, float adhesiveLimit, CColPoint* cp)
+    void* self, float friction, CColPoint& cp)
 {
-    if (self && cp && FindPlayerVehicleNative &&
-        FindPlayerVehicleNative(0, false) == self)
+    CAutomobile* car =
+        (CAutomobile*)FindPlayerVehicle(0, false);
+
+    if (car && self == car)
     {
-        // A normal real está em CColPoint::m_vecNormal.
-        // O valor absoluto também permite detectar contato
-        // com superfícies que tenham normal apontando para baixo.
-        if (AbsF(cp->m_vecNormal.z) > 0.55f)
-            sawGroundContact = true;
+        if (cp.m_vecNormal.z > 0.55f)
+            g_groundContact = true;
+
+        CMatrix* matrix = car->m_matrix;
+
+        if (matrix)
+        {
+            CVector rel(
+                cp.m_vecPoint.x - matrix->pos.x,
+                cp.m_vecPoint.y - matrix->pos.y,
+                cp.m_vecPoint.z - matrix->pos.z
+            );
+
+            float localX =
+                rel.x * matrix->right.x +
+                rel.y * matrix->right.y +
+                rel.z * matrix->right.z;
+
+            float localZ =
+                rel.x * matrix->up.x +
+                rel.y * matrix->up.y +
+                rel.z * matrix->up.z;
+
+            float normalUp = Abs(
+                cp.m_vecNormal.x * matrix->up.x +
+                cp.m_vecNormal.y * matrix->up.y +
+                cp.m_vecNormal.z * matrix->up.z
+            );
+
+            float normalSide = Abs(
+                cp.m_vecNormal.x * matrix->right.x +
+                cp.m_vecNormal.y * matrix->right.y +
+                cp.m_vecNormal.z * matrix->right.z
+            );
+
+            bool bodyContact =
+                (normalUp > 0.55f &&
+                 (localZ > 0.25f ||
+                  (Abs(localX) > 0.70f && localZ > -0.12f)))
+                ||
+                (normalSide > 0.65f && Abs(localX) > 0.55f);
+
+            if (bodyContact)
+                friction *= BODY_FRICTION;
+        }
     }
 
-    // Não aumenta a aderência: mantém o comportamento original.
-    return PhysicalApplyFriction(self, adhesiveLimit, cp);
+    return PhysicalApplyFriction(self, friction, cp);
 }
 
-DECL_HOOK(void, AutomobileProcessControl, void* self)
+DECL_HOOK(void, AutomobileProcessControl, CAutomobile* car)
 {
-    AutomobileProcessControl(self);
+    AutomobileProcessControl(car);
 
-    if (!self || !FindPlayerVehicleNative ||
-        FindPlayerVehicleNative(0, false) != self)
-    {
-        sawGroundContact = false;
-        return;
-    }
-
-    const bool grounded = sawGroundContact;
-    sawGroundContact = false;
-
-    if (forceCooldown > 0)
-        --forceCooldown;
-
-    if (!grounded || forceCooldown > 0)
+    if (!car)
         return;
 
-    auto* car = reinterpret_cast<CAutomobile*>(self);
-    auto* physical = reinterpret_cast<CPhysical*>(self);
+    if (FindPlayerVehicle(0, false) != car)
+        return;
 
-    CMatrix* matrix = car->GetMatrix();
+    bool grounded = g_groundContact;
+    g_groundContact = false;
 
+    if (g_cooldown > 0)
+        --g_cooldown;
+
+    if (!grounded || g_cooldown > 0)
+        return;
+
+    CMatrix* matrix = car->m_matrix;
     if (!matrix)
         return;
 
-    const CVector& right = matrix->GetRight();
-    const CVector& forward = matrix->GetForward();
-    const CVector& up = matrix->GetUp();
-
-    // Só inicia o efeito enquanto o carro ainda está
-    // relativamente próximo da posição normal.
-    if (up.z < MIN_UP_AXIS_Z ||
-        up.z > MAX_UPRIGHT_AXIS_Z)
+    // Evita aplicar o efeito quando o carro já está muito tombado.
+    if (matrix->up.z < 0.20f || matrix->up.z > 0.94f)
         return;
 
-    const CVector& velocity = physical->m_vecMoveSpeed;
+    CVector velocity = car->m_vecMoveSpeed;
 
-    const float forwardSpeed = AbsF(Dot3(
-        velocity.x, velocity.y, velocity.z,
-        forward.x, forward.y, forward.z));
-
-    const float lateralVelocity = Dot3(
-        velocity.x, velocity.y, velocity.z,
-        right.x, right.y, right.z);
-
-    const float lateralSpeed = AbsF(lateralVelocity);
-
-    if (forwardSpeed < MIN_FORWARD_SPEED ||
-        lateralSpeed < MIN_LATERAL_SPEED)
-        return;
-
-    const float speedFactor = Clamp01(
-        (forwardSpeed - MIN_FORWARD_SPEED) / SPEED_RAMP);
-
-    const float slipFactor = Clamp01(
-        (lateralSpeed - MIN_LATERAL_SPEED) / SLIP_RAMP);
-
-    const float forceAmount =
-        MAX_BLOWOVER_FORCE * speedFactor * slipFactor;
-
-    if (forceAmount < MIN_FORCE)
-        return;
-
-    // Escolhe o lado de aplicação conforme a derrapagem.
-    const float side =
-        lateralVelocity >= 0.0f ? -1.0f : 1.0f;
-
-    // O offset é um vetor relativo ao centro de massa,
-    // convertido para coordenadas do mundo usando a matriz.
-    const CVector offset(
-        right.x * side * SIDE_OFFSET -
-            forward.x * REAR_OFFSET,
-
-        right.y * side * SIDE_OFFSET -
-            forward.y * REAR_OFFSET,
-
-        right.z * side * SIDE_OFFSET -
-            forward.z * REAR_OFFSET
+    float forwardSpeed = Abs(
+        velocity.x * matrix->at.x +
+        velocity.y * matrix->at.y +
+        velocity.z * matrix->at.z
     );
 
-    const CVector force(0.0f, 0.0f, forceAmount);
+    float lateralVelocity =
+        velocity.x * matrix->right.x +
+        velocity.y * matrix->right.y +
+        velocity.z * matrix->right.z;
 
-    // Usa o método declarado no PSDK, evitando uma assinatura
-    // manual de função nativa para argumentos CVector.
-    physical->ApplyForce(force, offset, true);
+    float lateralSpeed = Abs(lateralVelocity);
 
-    forceCooldown = FORCE_COOLDOWN;
+    if (forwardSpeed < MIN_FORWARD ||
+        lateralSpeed < MIN_LATERAL)
+        return;
+
+    float speedFactor =
+        Clamp01((forwardSpeed - MIN_FORWARD) / SPEED_RAMP);
+
+    float slipFactor =
+        Clamp01((lateralSpeed - MIN_LATERAL) / SLIP_RAMP);
+
+    float forceAmount =
+        MAX_FORCE * speedFactor * slipFactor;
+
+    if (forceAmount < 0.5f)
+        return;
+
+    float side = lateralVelocity >= 0.0f ? -1.0f : 1.0f;
+
+    // Deslocamento relativo ao carro, não posição absoluta no mundo.
+    CVector offset(
+        matrix->right.x * side * SIDE_OFFSET -
+            matrix->at.x * REAR_OFFSET,
+        matrix->right.y * side * SIDE_OFFSET -
+            matrix->at.y * REAR_OFFSET,
+        matrix->right.z * side * SIDE_OFFSET -
+            matrix->at.z * REAR_OFFSET
+    );
+
+    CVector force(0.0f, 0.0f, forceAmount);
+
+    car->ApplyForce(force, offset, true);
+
+    g_cooldown = 8;
 }
 
 ON_MOD_LOAD()
 {
-    void* gtasaHandle = aml->GetLibHandle("libGTASA.so");
-
-    if (!gtasaHandle)
+    void* handle = aml->GetLibHandle("libGTASA.so");
+    if (!handle)
         return;
 
-    FindPlayerVehicleNative =
-        reinterpret_cast<FindPlayerVehicleFn>(
-            aml->GetSym(
-                gtasaHandle,
-                "_Z17FindPlayerVehicleib"
-            )
-        );
-
-    if (!FindPlayerVehicleNative)
+    if (!aml->GetSym(handle, "_Z17FindPlayerVehicleib"))
         return;
 
     HOOKSYM(
         PhysicalApplyFriction,
-        gtasaHandle,
+        handle,
         "_ZN9CPhysical13ApplyFrictionEfR9CColPoint"
     );
 
     HOOKSYM(
         AutomobileProcessControl,
-        gtasaHandle,
+        handle,
         "_ZN11CAutomobile14ProcessControlEv"
     );
 }
