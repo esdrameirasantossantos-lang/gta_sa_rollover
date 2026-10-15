@@ -1,134 +1,86 @@
-
 #include <mod/amlmod.h>
+#include <aml-psdk/game_sa/Physical.h>
+#include <aml-psdk/game_sa/Automobile.h>
+#include <aml-psdk/game_sa/ColModel.h>
 #include <cmath>
 #include <cstdint>
 
-MYMOD(net.esdra.realisticrollover, Realistic Rollover, 1.2, Esdra)
+MYMOD(net.esdra.realisticrollover, Realistic Rollover, 1.3, Esdra)
 
 BEGIN_DEPLIST()
     ADD_DEPENDENCY_VER(net.rusjj.aml, 1.3.0)
 END_DEPLIST()
 
-struct Vec3 {
-    float x, y, z;
-};
-
-static inline Vec3 Add(Vec3 a, Vec3 b) {
-    return {a.x + b.x, a.y + b.y, a.z + b.z};
+static inline float Dot3(
+    float ax, float ay, float az,
+    float bx, float by, float bz)
+{
+    return ax * bx + ay * by + az * bz;
 }
 
-static inline Vec3 Mul(Vec3 a, float s) {
-    return {a.x * s, a.y * s, a.z * s};
-}
-
-static inline float Dot(Vec3 a, Vec3 b) {
-    return a.x*b.x + a.y*b.y + a.z*b.z;
-}
-
-static inline float Abs(float x) {
-    return std::fabs(x);
-}
-
-static inline float Clamp01(float x) {
+static inline float Clamp01(float x)
+{
     return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
 }
 
-// CMatrix: right, up, at, position.
-struct MatrixSA {
-    Vec3 right; uint32_t flagsRight;
-    Vec3 up;    uint32_t flagsUp;
-    Vec3 at;    uint32_t flagsAt;
-    Vec3 pos;   uint32_t flagsPos;
-};
+static inline float AbsF(float x)
+{
+    return std::fabs(x);
+}
 
-// CColPoint: point, normal, depth, surface/piece/light bytes.
-struct ColPointSA {
-    Vec3 point;
-    Vec3 normal;
-    float depth;
-    uint8_t surfaceA, pieceA, lightA, camA;
-    uint8_t surfaceB, pieceB, lightB, camB;
-};
+// Configuração do capotamento.
+static constexpr float MIN_FORWARD_SPEED = 0.30f;
+static constexpr float MIN_LATERAL_SPEED = 0.10f;
+
+static constexpr float SPEED_RAMP = 1.00f;
+static constexpr float SLIP_RAMP = 0.55f;
+
+// Aumente para um capotamento mais forte.
+static constexpr float MAX_BLOWOVER_FORCE = 45.0f;
+
+static constexpr float SIDE_OFFSET = 1.00f;
+static constexpr float REAR_OFFSET = 0.25f;
+
+static constexpr float MIN_UP_AXIS_Z = 0.20f;
+static constexpr float MAX_UPRIGHT_AXIS_Z = 0.96f;
+
+static constexpr float MIN_FORCE = 1.0f;
+static constexpr int FORCE_COOLDOWN = 5;
 
 using FindPlayerVehicleFn = void* (*)(int, bool);
-using ApplyForceFn = void (*)(void*, Vec3, Vec3, bool);
 
 static FindPlayerVehicleFn FindPlayerVehicleNative = nullptr;
-static ApplyForceFn ApplyForceNative = nullptr;
 
 static bool sawGroundContact = false;
 static int forceCooldown = 0;
 
-// These offsets MUST match the GTA SA Android 2.00 build.
-static constexpr uintptr_t MATRIX_PTR_OFFSET = 0x14;
-static constexpr uintptr_t MOVE_SPEED_OFFSET = 0x48;
-
-// Body friction: a small increase, not global tire grip.
-static constexpr float BODY_FRICTION_MULTIPLIER = 1.12f;
-static constexpr float GROUND_NORMAL_Z_MIN = 0.55f;
-
-// Rollover tuning.
-static constexpr float MIN_FORWARD_SPEED = 0.45f;
-static constexpr float MIN_LATERAL_SPEED = 0.12f;
-static constexpr float SPEED_RAMP = 1.10f;
-static constexpr float SLIP_RAMP = 0.65f;
-static constexpr float MAX_BLOWOVER_FORCE = 12.0f;
-
-static constexpr float SIDE_OFFSET = 0.95f;
-static constexpr float REAR_OFFSET = 0.35f;
-static constexpr float MIN_UP_AXIS_Z = 0.20f;
-static constexpr float MAX_UPRIGHT_AXIS_Z = 0.94f;
-
 DECL_HOOK(bool, PhysicalApplyFriction,
-          void* self, float friction, ColPointSA* cp) {
-
+          void* self, float adhesiveLimit, CColPoint* cp)
+{
     if (self && cp && FindPlayerVehicleNative &&
-        FindPlayerVehicleNative(0, false) == self) {
-
-        // Detect ground contact.
-        if (cp->normal.z > GROUND_NORMAL_Z_MIN)
+        FindPlayerVehicleNative(0, false) == self)
+    {
+        // A normal real está em CColPoint::m_vecNormal.
+        // O valor absoluto também permite detectar contato
+        // com superfícies que tenham normal apontando para baixo.
+        if (AbsF(cp->m_vecNormal.z) > 0.55f)
             sawGroundContact = true;
-
-        auto* bytes = reinterpret_cast<uint8_t*>(self);
-        MatrixSA* matrix =
-            *reinterpret_cast<MatrixSA**>(bytes + MATRIX_PTR_OFFSET);
-
-        if (matrix) {
-            Vec3 rel = {
-                cp->point.x - matrix->pos.x,
-                cp->point.y - matrix->pos.y,
-                cp->point.z - matrix->pos.z
-            };
-
-            const float localX = Dot(rel, matrix->right);
-            const float localZ = Dot(rel, matrix->up);
-
-            // Increase friction only at likely body/roof/side contacts.
-            // Normal tire grip is not deliberately increased.
-            const float normalUp = Abs(Dot(cp->normal, matrix->up));
-            const float normalSide = Abs(Dot(cp->normal, matrix->right));
-
-            const bool bodyContact =
-                (normalUp > 0.55f &&
-                 (localZ > 0.25f ||
-                  (Abs(localX) > 0.70f && localZ > -0.12f))) ||
-                (normalSide > 0.65f &&
-                 Abs(localX) > 0.55f);
-
-            if (bodyContact)
-                friction *= BODY_FRICTION_MULTIPLIER;
-        }
     }
 
-    return PhysicalApplyFriction(self, friction, cp);
+    // Não aumenta a aderência: mantém o comportamento original.
+    return PhysicalApplyFriction(self, adhesiveLimit, cp);
 }
 
-DECL_HOOK(void, AutomobileProcessControl, void* self) {
+DECL_HOOK(void, AutomobileProcessControl, void* self)
+{
     AutomobileProcessControl(self);
 
-    if (!self || !FindPlayerVehicleNative || !ApplyForceNative ||
+    if (!self || !FindPlayerVehicleNative ||
         FindPlayerVehicleNative(0, false) != self)
+    {
+        sawGroundContact = false;
         return;
+    }
 
     const bool grounded = sawGroundContact;
     sawGroundContact = false;
@@ -139,25 +91,35 @@ DECL_HOOK(void, AutomobileProcessControl, void* self) {
     if (!grounded || forceCooldown > 0)
         return;
 
-    auto* bytes = reinterpret_cast<uint8_t*>(self);
+    auto* car = reinterpret_cast<CAutomobile*>(self);
+    auto* physical = reinterpret_cast<CPhysical*>(self);
 
-    MatrixSA* matrix =
-        *reinterpret_cast<MatrixSA**>(bytes + MATRIX_PTR_OFFSET);
+    CMatrix* matrix = car->GetMatrix();
 
-    Vec3* velocity =
-        reinterpret_cast<Vec3*>(bytes + MOVE_SPEED_OFFSET);
-
-    if (!matrix || !velocity)
+    if (!matrix)
         return;
 
-    // Avoid triggering when the car is almost upright or upside down.
-    if (matrix->up.z < MIN_UP_AXIS_Z ||
-        matrix->up.z > MAX_UPRIGHT_AXIS_Z)
+    const CVector& right = matrix->GetRight();
+    const CVector& forward = matrix->GetForward();
+    const CVector& up = matrix->GetUp();
+
+    // Só inicia o efeito enquanto o carro ainda está
+    // relativamente próximo da posição normal.
+    if (up.z < MIN_UP_AXIS_Z ||
+        up.z > MAX_UPRIGHT_AXIS_Z)
         return;
 
-    const float forwardSpeed = Abs(Dot(*velocity, matrix->at));
-    const float lateralVelocity = Dot(*velocity, matrix->right);
-    const float lateralSpeed = Abs(lateralVelocity);
+    const CVector& velocity = physical->m_vecMoveSpeed;
+
+    const float forwardSpeed = AbsF(Dot3(
+        velocity.x, velocity.y, velocity.z,
+        forward.x, forward.y, forward.z));
+
+    const float lateralVelocity = Dot3(
+        velocity.x, velocity.y, velocity.z,
+        right.x, right.y, right.z);
+
+    const float lateralSpeed = AbsF(lateralVelocity);
 
     if (forwardSpeed < MIN_FORWARD_SPEED ||
         lateralSpeed < MIN_LATERAL_SPEED)
@@ -172,56 +134,62 @@ DECL_HOOK(void, AutomobileProcessControl, void* self) {
     const float forceAmount =
         MAX_BLOWOVER_FORCE * speedFactor * slipFactor;
 
-    if (forceAmount < 0.5f)
+    if (forceAmount < MIN_FORCE)
         return;
 
+    // Escolhe o lado de aplicação conforme a derrapagem.
     const float side =
-        (lateralVelocity >= 0.0f) ? -1.0f : 1.0f;
+        lateralVelocity >= 0.0f ? -1.0f : 1.0f;
 
-    // Convert the vehicle-local application point to WORLD coordinates.
-    // ApplyForce expects the point of application, not a local offset.
-    Vec3 worldPoint = Add(
-        matrix->pos,
-        Add(
-            Mul(matrix->right, side * SIDE_OFFSET),
-            Mul(matrix->at, -REAR_OFFSET)
-        )
+    // O offset é um vetor relativo ao centro de massa,
+    // convertido para coordenadas do mundo usando a matriz.
+    const CVector offset(
+        right.x * side * SIDE_OFFSET -
+            forward.x * REAR_OFFSET,
+
+        right.y * side * SIDE_OFFSET -
+            forward.y * REAR_OFFSET,
+
+        right.z * side * SIDE_OFFSET -
+            forward.z * REAR_OFFSET
     );
 
-    // Upward force plus off-centre application creates roll torque.
-    Vec3 force = {0.0f, 0.0f, forceAmount};
+    const CVector force(0.0f, 0.0f, forceAmount);
 
-    ApplyForceNative(self, force, worldPoint, true);
+    // Usa o método declarado no PSDK, evitando uma assinatura
+    // manual de função nativa para argumentos CVector.
+    physical->ApplyForce(force, offset, true);
 
-    // Prevent the force from being applied every single frame.
-    forceCooldown = 8;
+    forceCooldown = FORCE_COOLDOWN;
 }
 
-ON_MOD_LOAD() {
+ON_MOD_LOAD()
+{
     void* gtasaHandle = aml->GetLibHandle("libGTASA.so");
+
     if (!gtasaHandle)
         return;
 
     FindPlayerVehicleNative =
         reinterpret_cast<FindPlayerVehicleFn>(
-            aml->GetSym(gtasaHandle, "_Z17FindPlayerVehicleib"));
-
-    ApplyForceNative =
-        reinterpret_cast<ApplyForceFn>(
             aml->GetSym(
                 gtasaHandle,
-                "_ZN9CPhysical10ApplyForceE7CVectorS0_b"));
+                "_Z17FindPlayerVehicleib"
+            )
+        );
 
-    if (!FindPlayerVehicleNative || !ApplyForceNative)
+    if (!FindPlayerVehicleNative)
         return;
 
     HOOKSYM(
         PhysicalApplyFriction,
         gtasaHandle,
-        "_ZN9CPhysical13ApplyFrictionEfR9CColPoint");
+        "_ZN9CPhysical13ApplyFrictionEfR9CColPoint"
+    );
 
     HOOKSYM(
         AutomobileProcessControl,
         gtasaHandle,
-        "_ZN11CAutomobile14ProcessControlEv");
+        "_ZN11CAutomobile14ProcessControlEv"
+    );
 }
