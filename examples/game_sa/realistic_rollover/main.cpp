@@ -2,7 +2,7 @@
 #include <aml-psdk/game_sa/entity/Automobile.h>
 #include <cmath>
 
-MYMOD(net.esdra.realisticrollover, Realistic Rollover, 1.6, Esdra)
+MYMOD(net.esdra.realisticrollover, Realistic Rollover, 1.7, Esdra)
 
 BEGIN_DEPLIST()
     ADD_DEPENDENCY_VER(net.rusjj.aml, 1.3.0)
@@ -15,35 +15,25 @@ static FindPlayerVehicleFn FindPlayerVehicleNative = nullptr;
 static ApplyTurnForceFn ApplyTurnForceNative = nullptr;
 static int g_cooldown = 0;
 
-// No friction hook or traction multiplier in this version.
-// These are deliberately conservative first-test values.
-static constexpr float MIN_FORWARD_SPEED = 0.28f;
-static constexpr float MIN_LATERAL_SPEED = 0.075f;
-static constexpr float SPEED_RAMP = 0.85f;
-static constexpr float SLIP_RAMP = 0.32f;
-static constexpr float MAX_ROLL_FORCE = 1.35f;
-static constexpr float MAX_REAR_LIFT_FORCE = 1.10f;
-static constexpr float SIDE_LEVER = 0.90f;
-static constexpr float REAR_LEVER = 1.25f;
-static constexpr int COOLDOWN_FRAMES = 5;
+// No friction hook and no traction multiplier.
+// ApplyTurnForce takes (force, local point offset). Do NOT pass a world position.
+static constexpr float MIN_FORWARD_SPEED = 0.30f;
+static constexpr float MIN_LATERAL_SPEED = 0.055f;
+static constexpr float SPEED_RAMP = 0.75f;
+static constexpr float SLIP_RAMP = 0.28f;
+static constexpr float MAX_ROLL_FORCE = 0.22f;
+static constexpr float MAX_REAR_LIFT_FORCE = 0.16f;
+static constexpr float SIDE_LEVER = 0.72f;
+static constexpr float REAR_LEVER = 1.10f;
+static constexpr int COOLDOWN_FRAMES = 4;
 
-static float Clamp01(float x)
-{
+static float Clamp01(float x) {
     return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
 }
-
 static float Abs(float x) { return std::fabs(x); }
-
-static CVector AddScaled(const CVector& p, const CVector& axis, float scale)
-{
-    return CVector(p.x + axis.x * scale,
-                   p.y + axis.y * scale,
-                   p.z + axis.z * scale);
-}
 
 DECL_HOOK(void, AutomobileProcessControl, CAutomobile* car)
 {
-    // Preserve original GTA vehicle processing.
     AutomobileProcessControl(car);
 
     if (!car || !FindPlayerVehicleNative || !ApplyTurnForceNative)
@@ -60,9 +50,9 @@ DECL_HOOK(void, AutomobileProcessControl, CAutomobile* car)
     if (!matrix)
         return;
 
-    // Do not keep injecting torque after the car is already upside down.
-    // An upright car has matrix->up.z close to 1.0.
-    if (matrix->up.z < 0.30f)
+    // Apply the extra rollover torque only while the car is reasonably upright.
+    // This avoids feeding more torque into a car that is already falling over.
+    if (matrix->up.z < 0.60f)
         return;
 
     const CVector velocity = car->m_vecMoveSpeed;
@@ -79,32 +69,26 @@ DECL_HOOK(void, AutomobileProcessControl, CAutomobile* car)
     if (forwardSpeed < MIN_FORWARD_SPEED || lateralSpeed < MIN_LATERAL_SPEED)
         return;
 
-    const float speedFactor = Clamp01(
-        (forwardSpeed - MIN_FORWARD_SPEED) / SPEED_RAMP);
-    const float slipFactor = Clamp01(
-        (lateralSpeed - MIN_LATERAL_SPEED) / SLIP_RAMP);
+    const float speedFactor = Clamp01((forwardSpeed - MIN_FORWARD_SPEED) / SPEED_RAMP);
+    const float slipFactor = Clamp01((lateralSpeed - MIN_LATERAL_SPEED) / SLIP_RAMP);
     const float intensity = speedFactor * slipFactor;
-    if (intensity < 0.02f)
+    if (intensity < 0.04f)
         return;
 
-    // Lateral motion chooses which side receives the upward force.
-    // ApplyTurnForce argument order is FORCE first, then WORLD-SPACE POINT.
-    // An upward force at the side creates roll torque without adding a direct
-    // linear launch impulse, and does not alter tire friction/traction.
+    // Local-space offset: X is the car's side axis; Y is its forward/rear axis.
+    // A small upward force at the side produces roll torque. The sign follows
+    // lateral movement so the effect acts toward the side the car is loading.
     const float side = (lateralVelocity >= 0.0f) ? -1.0f : 1.0f;
-    const CVector rollPoint = AddScaled(
-        AddScaled(matrix->pos, matrix->right, side * SIDE_LEVER),
-        matrix->at, -0.10f);
     const CVector rollForce(0.0f, 0.0f, MAX_ROLL_FORCE * intensity);
+    const CVector rollPoint(side * SIDE_LEVER, -0.10f, 0.0f);
     ApplyTurnForceNative(car, rollForce, rollPoint);
 
-    // At stronger speed + lateral slip, add a separate, smaller upward force
-    // at the rear point. Its lever arm encourages the rear to rise (pitch-over)
-    // instead of launching the vehicle's centre of mass upward.
-    if (intensity > 0.48f) {
-        const CVector rearPoint = AddScaled(matrix->pos, matrix->at, -REAR_LEVER);
-        const float liftIntensity = Clamp01((intensity - 0.48f) / 0.52f);
+    // A second, weaker upward force at a REAR local offset adds pitch torque,
+    // encouraging the rear to rise at high speed/slip without a centre-mass launch.
+    if (intensity > 0.58f) {
+        const float liftIntensity = Clamp01((intensity - 0.58f) / 0.42f);
         const CVector rearForce(0.0f, 0.0f, MAX_REAR_LIFT_FORCE * liftIntensity);
+        const CVector rearPoint(0.0f, -REAR_LEVER, 0.0f);
         ApplyTurnForceNative(car, rearForce, rearPoint);
     }
 
