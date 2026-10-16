@@ -1,9 +1,8 @@
 #include <mod/amlmod.h>
 #include <aml-psdk/game_sa/entity/Automobile.h>
-#include <aml-psdk/game_sa/base/ColModel.h>
 #include <cmath>
 
-MYMOD(net.esdra.realisticrollover, Realistic Rollover, 1.5, Esdra)
+MYMOD(net.esdra.realisticrollover, Realistic Rollover, 1.6, Esdra)
 
 BEGIN_DEPLIST()
     ADD_DEPENDENCY_VER(net.rusjj.aml, 1.3.0)
@@ -14,71 +13,42 @@ using ApplyTurnForceFn = void (*)(void*, CVector, CVector);
 
 static FindPlayerVehicleFn FindPlayerVehicleNative = nullptr;
 static ApplyTurnForceFn ApplyTurnForceNative = nullptr;
-
-// Only set when a collision point is classified as BODY contact, not wheel/ground contact.
-static bool g_bodyContact = false;
-static CVector g_bodyContactPoint(0.0f, 0.0f, 0.0f);
 static int g_cooldown = 0;
 
-static constexpr float BODY_FRICTION = 1.04f;
-static constexpr float MIN_FORWARD = 0.35f;
-static constexpr float MIN_LATERAL = 0.10f;
-static constexpr float SLIP_RAMP = 0.65f;
-static constexpr float ROLL_GAIN = 0.32f;
-static constexpr float MAX_ROLL_FORCE = 0.30f;
-static constexpr float MIN_TILT_UP_Z = 0.96f; // require some real body tilt before torque is added
+// No friction hook or traction multiplier in this version.
+// These are deliberately conservative first-test values.
+static constexpr float MIN_FORWARD_SPEED = 0.28f;
+static constexpr float MIN_LATERAL_SPEED = 0.075f;
+static constexpr float SPEED_RAMP = 0.85f;
+static constexpr float SLIP_RAMP = 0.32f;
+static constexpr float MAX_ROLL_FORCE = 1.35f;
+static constexpr float MAX_REAR_LIFT_FORCE = 1.10f;
+static constexpr float SIDE_LEVER = 0.90f;
+static constexpr float REAR_LEVER = 1.25f;
+static constexpr int COOLDOWN_FRAMES = 5;
 
-static float Clamp01(float x) {
+static float Clamp01(float x)
+{
     return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
 }
+
 static float Abs(float x) { return std::fabs(x); }
 
-DECL_HOOK(bool, PhysicalApplyFriction, void* self, float friction, CColPoint& cp)
+static CVector AddScaled(const CVector& p, const CVector& axis, float scale)
 {
-    if (FindPlayerVehicleNative) {
-        CVehicle* playerVehicle = FindPlayerVehicleNative(0, false);
-        if (playerVehicle && self == playerVehicle) {
-            CAutomobile* car = static_cast<CAutomobile*>(playerVehicle);
-            CMatrix* matrix = car->m_matrix;
-            if (matrix) {
-                CVector rel(
-                    cp.m_vecPoint.x - matrix->pos.x,
-                    cp.m_vecPoint.y - matrix->pos.y,
-                    cp.m_vecPoint.z - matrix->pos.z);
-
-                const float localX = rel.x * matrix->right.x + rel.y * matrix->right.y + rel.z * matrix->right.z;
-                const float localZ = rel.x * matrix->up.x + rel.y * matrix->up.y + rel.z * matrix->up.z;
-                const float normalUp = Abs(cp.m_vecNormal.x * matrix->up.x + cp.m_vecNormal.y * matrix->up.y + cp.m_vecNormal.z * matrix->up.z);
-                const float normalSide = Abs(cp.m_vecNormal.x * matrix->right.x + cp.m_vecNormal.y * matrix->right.y + cp.m_vecNormal.z * matrix->right.z);
-
-                const bool roofContact = normalUp > 0.55f && localZ > 0.25f;
-                const bool sideContact = normalSide > 0.55f && Abs(localX) > 0.55f && localZ > -0.12f;
-                const bool bodyContact = roofContact || sideContact;
-
-                if (bodyContact) {
-                    friction *= BODY_FRICTION;
-                    g_bodyContact = true;
-                    g_bodyContactPoint = cp.m_vecPoint; // world-space collision point
-                }
-            }
-        }
-    }
-    return PhysicalApplyFriction(self, friction, cp);
+    return CVector(p.x + axis.x * scale,
+                   p.y + axis.y * scale,
+                   p.z + axis.z * scale);
 }
 
 DECL_HOOK(void, AutomobileProcessControl, CAutomobile* car)
 {
+    // Preserve original GTA vehicle processing.
     AutomobileProcessControl(car);
 
-    if (!car || !FindPlayerVehicleNative || !ApplyTurnForceNative ||
-        FindPlayerVehicleNative(0, false) != car)
+    if (!car || !FindPlayerVehicleNative || !ApplyTurnForceNative)
         return;
-
-    const bool bodyContact = g_bodyContact;
-    const CVector contactPoint = g_bodyContactPoint;
-    g_bodyContact = false;
-
-    if (!bodyContact)
+    if (FindPlayerVehicleNative(0, false) != car)
         return;
 
     if (g_cooldown > 0) {
@@ -90,31 +60,55 @@ DECL_HOOK(void, AutomobileProcessControl, CAutomobile* car)
     if (!matrix)
         return;
 
-    // Avoid applying extra torque while the vehicle is still fully upright.
-    if (matrix->up.z > MIN_TILT_UP_Z || matrix->up.z < -0.25f)
+    // Do not keep injecting torque after the car is already upside down.
+    // An upright car has matrix->up.z close to 1.0.
+    if (matrix->up.z < 0.30f)
         return;
 
     const CVector velocity = car->m_vecMoveSpeed;
-    const float forwardSpeed = Abs(velocity.x * matrix->at.x + velocity.y * matrix->at.y + velocity.z * matrix->at.z);
-    const float lateralVelocity = velocity.x * matrix->right.x + velocity.y * matrix->right.y + velocity.z * matrix->right.z;
+    const float forwardSpeed = Abs(
+        velocity.x * matrix->at.x +
+        velocity.y * matrix->at.y +
+        velocity.z * matrix->at.z);
+    const float lateralVelocity =
+        velocity.x * matrix->right.x +
+        velocity.y * matrix->right.y +
+        velocity.z * matrix->right.z;
     const float lateralSpeed = Abs(lateralVelocity);
 
-    if (forwardSpeed < MIN_FORWARD || lateralSpeed < MIN_LATERAL)
+    if (forwardSpeed < MIN_FORWARD_SPEED || lateralSpeed < MIN_LATERAL_SPEED)
         return;
 
-    const float slipFactor = Clamp01((lateralSpeed - MIN_LATERAL) / SLIP_RAMP);
-    float torqueForce = ROLL_GAIN * slipFactor;
-    if (torqueForce > MAX_ROLL_FORCE)
-        torqueForce = MAX_ROLL_FORCE;
-    if (torqueForce < 0.025f)
+    const float speedFactor = Clamp01(
+        (forwardSpeed - MIN_FORWARD_SPEED) / SPEED_RAMP);
+    const float slipFactor = Clamp01(
+        (lateralSpeed - MIN_LATERAL_SPEED) / SLIP_RAMP);
+    const float intensity = speedFactor * slipFactor;
+    if (intensity < 0.02f)
         return;
 
-    // ApplyTurnForce changes angular motion only; unlike ApplyForce, it does not
-    // add the same direct upward linear impulse that launched the car in v1.4.
-    // Arguments are world contact point, then world-space force vector.
-    const CVector torqueVector(0.0f, 0.0f, torqueForce);
-    ApplyTurnForceNative(car, contactPoint, torqueVector);
-    g_cooldown = 6;
+    // Lateral motion chooses which side receives the upward force.
+    // ApplyTurnForce argument order is FORCE first, then WORLD-SPACE POINT.
+    // An upward force at the side creates roll torque without adding a direct
+    // linear launch impulse, and does not alter tire friction/traction.
+    const float side = (lateralVelocity >= 0.0f) ? -1.0f : 1.0f;
+    const CVector rollPoint = AddScaled(
+        AddScaled(matrix->pos, matrix->right, side * SIDE_LEVER),
+        matrix->at, -0.10f);
+    const CVector rollForce(0.0f, 0.0f, MAX_ROLL_FORCE * intensity);
+    ApplyTurnForceNative(car, rollForce, rollPoint);
+
+    // At stronger speed + lateral slip, add a separate, smaller upward force
+    // at the rear point. Its lever arm encourages the rear to rise (pitch-over)
+    // instead of launching the vehicle's centre of mass upward.
+    if (intensity > 0.48f) {
+        const CVector rearPoint = AddScaled(matrix->pos, matrix->at, -REAR_LEVER);
+        const float liftIntensity = Clamp01((intensity - 0.48f) / 0.52f);
+        const CVector rearForce(0.0f, 0.0f, MAX_REAR_LIFT_FORCE * liftIntensity);
+        ApplyTurnForceNative(car, rearForce, rearPoint);
+    }
+
+    g_cooldown = COOLDOWN_FRAMES;
 }
 
 ON_MOD_LOAD()
@@ -131,8 +125,6 @@ ON_MOD_LOAD()
     if (!FindPlayerVehicleNative || !ApplyTurnForceNative)
         return;
 
-    HOOKSYM(PhysicalApplyFriction, handle,
-            "_ZN9CPhysical13ApplyFrictionEfR9CColPoint");
     HOOKSYM(AutomobileProcessControl, handle,
             "_ZN11CAutomobile14ProcessControlEv");
 }
